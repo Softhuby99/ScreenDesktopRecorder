@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtuelle Umgebungen
+venv/
+.venv/
+build_venv/
+
+# PyInstaller-Build-Artefakte
+build/
+dist/
+*.spec
+
+# Von PyInstaller/FFmpeg zur Laufzeit benoetigt, aber nicht ins Repo
+# (Lizenzgroesse + wird von der GitHub-Action automatisch geladen)
+bin/ffmpeg.exe
+bin/ffmpeg
+
+# Editor-/OS-Muell
+.vscode/
+.idea/
+*.bak
+.DS_Store
+Thumbs.db

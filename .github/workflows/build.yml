@@ -1,0 +1,107 @@
+name: Builds (Windows + Linux)
+
+# Laeuft automatisch bei jedem Push auf main/master und laesst sich
+# zusaetzlich manuell ueber den "Run workflow"-Button anstossen.
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+
+jobs:
+  # ==========================================================================
+  # WINDOWS: eigenstaendige .exe mit eingebettetem FFmpeg
+  # ==========================================================================
+  build-windows:
+    # PyInstaller kann nur fuer die Plattform bauen, auf der es selbst
+    # laeuft - deshalb muss dieser Job auf einem echten Windows-Runner
+    # laufen (nicht ubuntu-latest).
+    runs-on: windows-latest
+
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: FFmpeg (Windows-Build) herunterladen
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile "ffmpeg.zip"
+          Expand-Archive -Path "ffmpeg.zip" -DestinationPath "ffmpeg_extracted"
+          $ffmpegExe = Get-ChildItem -Path "ffmpeg_extracted" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "bin" | Out-Null
+          Copy-Item $ffmpegExe.FullName -Destination "bin\ffmpeg.exe"
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bin\requirements.txt
+          pip install "pyinstaller>=6.3.0"
+
+      - name: Eigenstaendige EXE bauen
+        run: |
+          pyinstaller `
+            --name "ScreenRecPro" `
+            --onefile `
+            --windowed `
+            --add-binary "bin\ffmpeg.exe;bin" `
+            --collect-all customtkinter `
+            --collect-all sounddevice `
+            --hidden-import "PIL._tkinter_finder" `
+            main.py
+
+      - name: EXE als Download-Artefakt bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecPro-windows
+          path: dist/ScreenRecPro.exe
+          retention-days: 30
+
+  # ==========================================================================
+  # LINUX: eigenstaendige Binary - nutzt wie im Quellcode vorgesehen das
+  # systemweite FFmpeg (get_ffmpeg_path() bevorzugt $PATH unter Linux),
+  # daher wird hier keine FFmpeg-Binary mit eingebettet. Nutzer brauchen
+  # weiterhin 'sudo apt install ffmpeg' (siehe README).
+  # ==========================================================================
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Systemabhaengigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk ffmpeg
+
+      - name: Abhaengigkeiten installieren
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bin/requirements.txt
+          pip install "pyinstaller>=6.3.0"
+
+      - name: Eigenstaendige Linux-Binary bauen
+        run: |
+          pyinstaller \
+            --name "ScreenRecPro" \
+            --onefile \
+            --collect-all customtkinter \
+            --collect-all sounddevice \
+            --hidden-import "PIL._tkinter_finder" \
+            main.py
+
+      - name: Binary als Download-Artefakt bereitstellen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScreenRecPro-linux
+          path: dist/ScreenRecPro
+          retention-days: 30

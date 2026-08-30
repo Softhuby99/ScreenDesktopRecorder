@@ -1,0 +1,24 @@
+# ============================================================================
+# ScreenRec Pro - Laufzeit-Abhaengigkeiten
+# Installation:  pip install -r bin/requirements.txt
+# ============================================================================
+
+# GUI-Framework (Windows 11 Fluent/Dark-Mode) - bringt Pillow als
+# Abhaengigkeit mit (wird u. a. fuer Icons/Widgets benoetigt)
+customtkinter>=5.2.2
+
+# Ressourcenschonende Messung der Hardware-Auslastung im Performance-Test
+psutil>=5.9.8
+
+# Automatische Erkennung von Mikrofon-/Systemton-Eingaben
+sounddevice>=0.4.7
+
+# Wird von customtkinter fuer Widget-Grafiken benoetigt (hier explizit
+# gepinnt, damit PyInstaller sie zuverlaessig findet)
+pillow>=10.2.0
+
+# ----------------------------------------------------------------------------
+# Nur zum ERSTELLEN der Windows-EXE noetig, nicht zur Laufzeit:
+#   pip install pyinstaller
+# (siehe bin/build_windows.bat - installiert sich dort automatisch mit)
+# ----------------------------------------------------------------------------
