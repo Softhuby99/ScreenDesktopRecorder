@@ -215,6 +215,69 @@ def get_audio_sources() -> list[tuple[str, str]]:
     return list_sounddevice_inputs()
 
 
+def list_meter_devices() -> list[tuple[str, int]]:
+    """
+    Listet alle Eingabegeräte so, wie sounddevice/PortAudio sie sieht -
+    inklusive numerischem Index (wird zum Öffnen einer Live-Vorschau in
+    audio_meter.py benötigt).
+
+    Bewusst GETRENNT von get_audio_sources(): dort zählen die exakten
+    FFmpeg-Bezeichner (pactl-Sourcename / DirectShow-Name), die für die
+    eigentliche Aufnahme zwingend exakt stimmen müssen. PortAudio vergibt
+    eigene Indizes/Namen, die davon abweichen können - für eine reine
+    Pegel-Vorschau (nicht für die Aufnahme selbst) reicht das aber aus.
+    """
+    try:
+        import sounddevice as sd
+    except Exception:
+        return []
+
+    results: list[tuple[str, int]] = []
+    try:
+        for idx, device in enumerate(sd.query_devices()):
+            if device.get("max_input_channels", 0) > 0:
+                name = str(device.get("name", "")).strip() or f"Gerät {idx}"
+                results.append((name, idx))
+    except Exception:
+        return []
+    return results
+
+
+_SYSTEM_AUDIO_KEYWORDS = (
+    "monitor", "stereo mix", "stereo-mix", "stereomix",
+    "what u hear", "wave out", "loopback", "summe", "systemton",
+)
+
+
+def guess_microphone_default(devices: list[tuple[str, int]]) -> int | None:
+    """
+    Best-Guess: das erste Gerät aus list_meter_devices(), das NICHT wie
+    ein Systemton-/Monitor-Eingang aussieht. Reine Heuristik für die
+    Vorauswahl der Live-Vorschau - der Nutzer kann jederzeit manuell
+    umschalten.
+    """
+    for name, idx in devices:
+        low = name.lower()
+        if not any(kw in low for kw in _SYSTEM_AUDIO_KEYWORDS):
+            return idx
+    return devices[0][1] if devices else None
+
+
+def guess_speaker_monitor_default(devices: list[tuple[str, int]]) -> int | None:
+    """
+    Best-Guess: das erste Gerät aus list_meter_devices(), das wie ein
+    Systemton-/Monitor-/Loopback-Eingang aussieht (Linux: Pulse-Monitor,
+    Windows: 'Stereo Mix', falls in der Sound-Systemsteuerung aktiviert).
+    Liefert None, wenn nichts dergleichen gefunden wurde - üblich unter
+    Windows ohne aktivierten Stereo Mix.
+    """
+    for name, idx in devices:
+        low = name.lower()
+        if any(kw in low for kw in _SYSTEM_AUDIO_KEYWORDS):
+            return idx
+    return None
+
+
 def find_system_audio(sources: list[tuple[str, str]]) -> str | None:
     """
     Sucht eine Systemton-Loopback-Quelle.

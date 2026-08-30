@@ -24,6 +24,8 @@ from config import (
     CRF_X264,
     CRF_X265,
     PIXEL_FORMAT,
+    QSV_ENCODERS,
+    QSV_GLOBAL_QUALITY,
 )
 from platform_utils import (
     IS_LINUX,
@@ -122,6 +124,42 @@ def check_encoder_available(encoder: str) -> bool:
         return encoder in result.stdout
     except Exception:
         return True  # Im Zweifel erlauben
+
+
+def check_qsv_available(encoder: str, timeout: int = 8) -> bool:
+    """
+    Prüft, ob ein Intel-Quick-Sync-Encoder (h264_qsv/hevc_qsv/av1_qsv)
+    tatsächlich benutzt werden kann.
+
+    Reines Vorhandensein im FFmpeg-Build (check_encoder_available) reicht
+    bei QSV NICHT aus - das sagt nur, dass FFmpeg mit QSV-Unterstützung
+    kompiliert wurde, nicht ob die lokale Intel-GPU/Treiber/Kernel-Version
+    die Kodierung tatsächlich beherrschen (v. a. av1_qsv braucht eine
+    neuere Intel-iGPU-Generation). Deshalb wird zusätzlich eine winzige
+    Testkodierung durchgeführt.
+    """
+    import subprocess
+    from platform_utils import get_subprocess_flags
+
+    if not check_encoder_available(encoder):
+        return False
+
+    try:
+        cmd = [
+            get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+            "-frames:v", "5",
+            "-c:v", encoder,
+            "-global_quality", QSV_GLOBAL_QUALITY,
+            "-f", "null", "-",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            **get_subprocess_flags(),
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -226,25 +264,80 @@ def build_audio_input_args(audio_device: str | None) -> list:
 # ============================================================================
 # 4) OUTPUT-ENCODING
 # ============================================================================
-def build_output_args(encoder: str, preset: str, has_audio: bool) -> list:
+def _build_audio_filter_args(gain: float, denoise: bool) -> list:
+    """
+    Baut eine optionale '-af'-Filterkette für die Mikrofon-Aufnahme:
+      - afftdn:  einfache Rauschunterdrückung (Wunsch: "Performance vom Mikro")
+      - volume:  digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
+    Wird nur angehängt, wenn tatsächlich etwas zu verändern ist - eine
+    leere Filterkette würde FFmpeg unnötig zusätzliche Arbeit aufbürden.
+    """
+    filters = []
+    if denoise:
+        filters.append("afftdn")
+    if gain is not None and abs(gain - 1.0) > 0.005:
+        filters.append(f"volume={gain:.3f}")
+    return ["-af", ",".join(filters)] if filters else []
+
+
+def build_output_args(
+    encoder: str, preset: str, has_audio: bool, audio_only: bool = False,
+    gain: float = 1.0, denoise: bool = False,
+) -> list:
     """
     Baut die Encoding-Parameter - identisch auf allen Plattformen.
+
+    Bei audio_only=True wird JEDER Video-Parameter ausgelassen (kein
+    Encoder, kein CRF, kein Preset) - es gibt schlicht keinen
+    Video-Stream, der kodiert werden müsste.
+
+    gain/denoise wirken NUR auf die Audiospur (Mikrofon-"Verstärkung" und
+    einfache Rauschunterdrückung) und werden komplett ignoriert, wenn
+    has_audio=False ist.
     """
-    crf = CRF_X265 if encoder == "libx265" else CRF_X264
+    audio_filter_args = _build_audio_filter_args(gain, denoise) if has_audio else []
 
-    args = [
-        "-c:v", encoder,
-        "-preset", preset,
-        "-crf", crf,
-        # Nulllatenz-Tuning: reduziert RAM-Bedarf & Lookahead-Rechenlast
-        "-tune", "zerolatency",
-        "-pix_fmt", PIXEL_FORMAT,
-        "-g", "60",                    # Keyframe alle 2 s bei 30 FPS
-        "-movflags", "+faststart",     # MP4 sofort abspielbar
-    ]
+    if audio_only:
+        return [
+            "-vn",  # explizit keine Video-Ausgabe
+            "-c:a", AUDIO_CODEC,
+            "-b:a", AUDIO_BITRATE,
+            "-ar", AUDIO_SAMPLERATE,
+            "-ac", "2",
+            *audio_filter_args,
+        ]
 
-    if encoder == "libx265":
-        args += ["-tag:v", "hvc1"]
+    is_qsv = encoder in QSV_ENCODERS
+
+    if is_qsv:
+        # Intel Quick Sync kennt weder '-crf' noch '-tune zerolatency' und
+        # unterstützt die Presets 'ultrafast'/'superfast' von libx264/265
+        # nicht - auf 'veryfast' abbilden statt einen FFmpeg-Fehler zu riskieren.
+        qsv_preset = "veryfast" if preset in ("ultrafast", "superfast") else preset
+        args = [
+            "-c:v", encoder,
+            "-preset", qsv_preset,
+            "-global_quality", QSV_GLOBAL_QUALITY,
+            "-pix_fmt", PIXEL_FORMAT,
+            "-g", "60",
+            "-movflags", "+faststart",
+        ]
+        if encoder == "hevc_qsv":
+            args += ["-tag:v", "hvc1"]
+    else:
+        crf = CRF_X265 if encoder == "libx265" else CRF_X264
+        args = [
+            "-c:v", encoder,
+            "-preset", preset,
+            "-crf", crf,
+            # Nulllatenz-Tuning: reduziert RAM-Bedarf & Lookahead-Rechenlast
+            "-tune", "zerolatency",
+            "-pix_fmt", PIXEL_FORMAT,
+            "-g", "60",                    # Keyframe alle 2 s bei 30 FPS
+            "-movflags", "+faststart",     # MP4 sofort abspielbar
+        ]
+        if encoder == "libx265":
+            args += ["-tag:v", "hvc1"]
 
     if has_audio:
         args += [
@@ -252,6 +345,7 @@ def build_output_args(encoder: str, preset: str, has_audio: bool) -> list:
             "-b:a", AUDIO_BITRATE,
             "-ar", AUDIO_SAMPLERATE,
             "-ac", "2",
+            *audio_filter_args,
         ]
 
     return args
@@ -268,9 +362,21 @@ def build_record_command(
     mode_region: bool = False,
     region: tuple | None = None,
     audio_device: str | None = None,
+    audio_only: bool = False,
+    gain: float = 1.0,
+    denoise: bool = False,
 ) -> list:
     """
     Setzt das vollständige FFmpeg-Aufnahmekommando zusammen.
+
+    audio_only=True überspringt die komplette Video-Eingabe (kein
+    gdigrab/x11grab) - es wird ausschließlich die Audioquelle aufgezeichnet.
+    Ein audio_device ist in diesem Fall zwingend erforderlich (wird von
+    der GUI vor dem Start erzwungen).
+
+    gain/denoise betreffen ausschließlich die Mikrofonspur (Verstärkung /
+    einfache Rauschunterdrückung) und werden ignoriert, wenn kein
+    audio_device gesetzt ist.
     """
     cmd = [
         get_ffmpeg_path(),
@@ -279,13 +385,16 @@ def build_record_command(
         "-y",
     ]
 
-    cmd += build_video_input_args(mode_region, region, fps)
+    if not audio_only:
+        cmd += build_video_input_args(mode_region, region, fps)
     cmd += build_audio_input_args(audio_device)
 
-    has_audio = bool(audio_device)
-    cmd += build_output_args(encoder, preset, has_audio)
+    has_audio = bool(audio_device) or audio_only
+    cmd += build_output_args(
+        encoder, preset, has_audio, audio_only=audio_only, gain=gain, denoise=denoise,
+    )
 
-    if has_audio:
+    if has_audio and not audio_only:
         cmd += ["-shortest"]
 
     cmd.append(output_path)

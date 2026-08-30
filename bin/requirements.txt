@@ -10,7 +10,8 @@ customtkinter>=5.2.2
 # Ressourcenschonende Messung der Hardware-Auslastung im Performance-Test
 psutil>=5.9.8
 
-# Automatische Erkennung von Mikrofon-/Systemton-Eingaben
+# Automatische Erkennung von Mikrofon-/Systemton-Eingaben + Live-Pegelanzeige
+# im Audio-Tab (siehe audio_meter.py - bewusst ohne NumPy realisiert)
 sounddevice>=0.4.7
 
 # Wird von customtkinter fuer Widget-Grafiken benoetigt (hier explizit

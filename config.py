@@ -40,8 +40,14 @@ RADIUS_SM = 6
 FPS_OPTIONS = ["24", "30", "60"]
 DEFAULT_FPS = "30"
 
-ENCODER_OPTIONS = ["libx264", "libx265"]
+ENCODER_OPTIONS = ["libx264", "libx265", "h264_qsv", "hevc_qsv", "av1_qsv"]
 DEFAULT_ENCODER = "libx264"
+
+# Intel Quick Sync (Hardware-Encoder). Diese drei kennen weder '-crf' noch
+# das 'ultrafast'/'superfast'-Preset von libx264/libx265 - eigene
+# Rate-Control-Logik in ffmpeg_utils.py (build_output_args).
+QSV_ENCODERS = ("h264_qsv", "hevc_qsv", "av1_qsv")
+QSV_GLOBAL_QUALITY = "23"  # vergleichbare Skala wie CRF (kleiner = bessere Qualität)
 
 PRESET_OPTIONS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"]
 DEFAULT_PRESET = "faster"
@@ -94,8 +100,25 @@ BENCHMARK_TIERS = [
 ]
 
 # ----------------------------------------------------------------------------
-# AUFNAHME-MODI
+# AUFNAHME-MODI (nur noch für den "Video"-Tab - Bereichsauswahl etc.)
 # ----------------------------------------------------------------------------
 MODE_FULLSCREEN = "Vollbild"
 MODE_REGION = "Bereich wählen"
 MODE_OPTIONS = [MODE_FULLSCREEN, MODE_REGION]
+
+# Der reine Audio-Modus ist kein Eintrag im Modus-Dropdown mehr, sondern
+# ein eigener Tab ("Audio") in der GUI - siehe gui_main.py.
+# Dateiendung dafür (kein Container-/Encoder-Wechsel nötig - AAC in einem
+# .m4a-Container ist auf allen drei Plattformen ohne Zusatzsoftware
+# abspielbar):
+AUDIO_ONLY_EXTENSION = "m4a"
+
+# ----------------------------------------------------------------------------
+# MIKROFON-/LAUTSPRECHER-VORSCHAU (Audio-Tab)
+# ----------------------------------------------------------------------------
+METER_REFRESH_MS = 80        # ~12,5 Hz - fluessig genug, ressourcenschonend
+
+MIC_GAIN_MIN = 0.5
+MIC_GAIN_MAX = 3.0
+MIC_GAIN_DEFAULT = 1.0
+MIC_GAIN_STEPS = 25          # Schrittweite des Sliders

@@ -11,7 +11,9 @@ eigenständige Programme auf echten Runnern der jeweiligen Plattform:
 - **Windows:** `ScreenRecPro.exe` (inkl. eingebettetem FFmpeg, läuft ohne
   weitere Installation)
 - **Linux:** `ScreenRecPro` (nutzt das systemweite FFmpeg - vorher einmalig
-  `sudo apt install ffmpeg`)
+  `sudo apt install ffmpeg libportaudio2`; ohne `libportaudio2` startet die
+  App trotzdem, aber die Mikrofon-/Lautsprecher-Vorschau im Audio-Tab
+  bleibt auf "nicht verfügbar")
 
 So kommst du an die Dateien:
 
@@ -32,8 +34,9 @@ pip install -r bin/requirements.txt
 python main.py
 ```
 
-Benötigt zusätzlich ein systemweit installiertes `ffmpeg` (z. B.
-`sudo apt install ffmpeg`).
+Benötigt zusätzlich systemweit installiertes `ffmpeg` sowie `libportaudio2`
+(für die Mikrofon-/Lautsprecher-Vorschau im Audio-Tab), z. B.:
+`sudo apt install ffmpeg libportaudio2`.
 
 ## Lokal unter Windows bauen (Alternative zu GitHub Actions)
 
@@ -47,12 +50,30 @@ installiert alle Abhängigkeiten sowie PyInstaller und baut
 | Datei | Zweck |
 |---|---|
 | `main.py` | Einstiegspunkt, Abhängigkeits-Check, Plattform-Vorbereitung |
-| `gui_main.py` | Hauptfenster (CustomTkinter, Dark Mode) |
+| `gui_main.py` | Hauptfenster (CustomTkinter, Dark Mode) - Tabs "Video" und "Audio" |
 | `gui_mini.py` | Schwebendes Mini-Bedienfeld während der Aufnahme |
+| `gui_widgets.py` | Wiederverwendbare UI-Bausteine (z. B. der bunte Pegelbalken) |
 | `benchmark.py` | Automatischer Performance-Test (Thread) |
 | `recorder.py` | FFmpeg-Aufnahmesteuerung (Thread) |
 | `ffmpeg_utils.py` | FFmpeg-Pfadauflösung und Kommando-Builder |
-| `audio_devices.py` | Cross-platform Audiogeräte-Erkennung |
+| `audio_devices.py` | Cross-platform Audiogeräte-Erkennung (Aufnahme + Live-Vorschau) |
+| `audio_meter.py` | Echtzeit-Pegelmesser (RMS/Peak) für Mikrofon-/Lautsprecher-Vorschau |
 | `region_selector.py` | Bereichsauswahl-Overlay |
 | `platform_utils.py` | Betriebssystem-Abstraktion (Windows/Linux/macOS) |
 | `config.py` | Zentrale Konstanten (Farben, Encoding-Presets, Benchmark-Matrix) |
+
+## Video- und Audio-Tab
+
+Das Hauptfenster ist in zwei Tabs aufgeteilt:
+
+- **Video**: klassische Bildschirmaufnahme (Vollbild oder Bereich), mit
+  Framerate, Video-Encoder (inkl. Intel Quick Sync H.264/HEVC/AV1) und
+  optional einer zusätzlichen Audiospur.
+- **Audio**: reine Tonaufnahme ohne Bild (Ausgabe als `.m4a`). Mikrofon
+  und - sofern vom System bereitgestellt (Linux: PulseAudio-Monitor,
+  Windows: "Stereo Mix") - der Systemton lassen sich mit einer live
+  ausschlagenden Pegelanzeige auswählen; zusätzlich einstellbar sind eine
+  digitale Verstärkung sowie eine einfache Rauschunterdrückung.
+
+Welcher der beiden Tabs gerade offen ist, bestimmt, was der
+"Start"-Button unten aufnimmt.

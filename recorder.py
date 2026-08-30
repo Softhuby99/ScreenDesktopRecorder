@@ -127,6 +127,9 @@ class RecorderThread(threading.Thread):
                 mode_region=self.settings.get("mode_region", False),
                 region=self.settings.get("region"),
                 audio_device=self.settings.get("audio_device"),
+                audio_only=self.settings.get("audio_only", False),
+                gain=self.settings.get("gain", 1.0),
+                denoise=self.settings.get("denoise", False),
             )
 
             self._process = subprocess.Popen(
