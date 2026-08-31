@@ -48,7 +48,10 @@ from config import (
 )
 from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpeg_path
 from gui_mini import MiniPanel
-from optimizer import OPTIMIZE_PROFILES, OptimizeThread, get_profile, suggest_output_path
+from optimizer import (
+    OPTIMIZE_PROFILES, OptimizeThread, get_profile, probe_duration_seconds,
+    suggest_output_path,
+)
 from gui_widgets import LevelMeterBar
 from platform_utils import (
     IS_WINDOWS, even_dimensions, get_default_videos_dir, get_platform_warning,
@@ -1184,6 +1187,11 @@ class MainWindow(ctk.CTk):
             self.recorder.stop()
 
     def _on_recording_stopped(self, path: str, success: bool):
+        # Vor dem Zuruecksetzen sichern - wird gebraucht, um eine evtl.
+        # vorzeitig abgeschnittene Aufnahme zu erkennen (siehe
+        # _check_recording_truncated).
+        elapsed = self.recorder.get_elapsed() if self.recorder else 0.0
+
         if self.mini_panel:
             try:
                 self.mini_panel.destroy()
@@ -1208,6 +1216,11 @@ class MainWindow(ctk.CTk):
             # Video-Encoder) verarbeiten könnten.
             if not self._active_audio_only:
                 self._set_optimize_file(path)
+            threading.Thread(
+                target=self._check_recording_truncated,
+                args=(path, elapsed),
+                daemon=True,
+            ).start()
             if messagebox.askyesno(
                 "Aufnahme fertig",
                 f"Datei gespeichert:\n{os.path.basename(path)}  ({size_mb:.1f} MB)\n\n"
@@ -1216,6 +1229,47 @@ class MainWindow(ctk.CTk):
                 open_file_manager(path)
         else:
             self._set_status("Aufnahme fehlgeschlagen – keine Datei erzeugt.", COLOR_DANGER)
+
+    def _check_recording_truncated(self, path: str, elapsed_seconds: float):
+        """
+        Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
+        vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
+        der fertigen Datei.
+
+        Hintergrund: ein Aussetzer der Audioaufnahme (z. B. Puffer-
+        Überlauf beim Mikrofon) kann FFmpeg dazu bringen, den Audio-Input
+        vorzeitig zu beenden - das passiert mit sauberem Exit-Code, wird
+        also von RecorderThread NICHT als Fehler erkannt und bislang auch
+        nicht dem Nutzer gemeldet. Ergebnis: eine "erfolgreich" gemeldete,
+        aber nur wenige Sekunden/KB große Datei. Diese Prüfung holt das
+        nachträglich sichtbar nach.
+        """
+        if elapsed_seconds < 4:
+            return  # zu kurz fuer eine verlaessliche Aussage
+        try:
+            duration = probe_duration_seconds(path)
+        except Exception:
+            return
+        if duration is None:
+            return
+        if duration < elapsed_seconds * 0.7 - 1.0:
+            self.after(0, self._warn_possible_truncation, elapsed_seconds, duration)
+
+    def _warn_possible_truncation(self, elapsed_seconds: float, duration: float):
+        self._set_status(
+            f"⚠ Datei evtl. unvollständig: {duration:.0f}s statt {elapsed_seconds:.0f}s",
+            COLOR_WARNING,
+        )
+        messagebox.showwarning(
+            "Aufnahme möglicherweise unvollständig",
+            f"Die Aufnahme lief {elapsed_seconds:.0f} s, die gespeicherte Datei "
+            f"enthält aber nur {duration:.0f} s.\n\n"
+            "Das deutet auf einen Aussetzer der Audioaufnahme während der "
+            "Aufnahme hin (z. B. ein kurzzeitiger Mikrofon-Puffer-Überlauf), "
+            "durch den Video und Audio vorzeitig beendet wurden.\n\n"
+            "Falls das öfter passiert: anderes Mikrofon/Audiogerät probieren "
+            "oder testweise ganz ohne Audiospur aufnehmen.",
+        )
 
     def _on_recording_error(self, message: str):
         short = message.split("\n")[0][:200]

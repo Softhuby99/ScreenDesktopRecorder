@@ -270,7 +270,18 @@ def build_audio_input_args(audio_device: str | None) -> list:
         return [
             "-f", "dshow",
             "-thread_queue_size", "1024",
-            "-audio_buffer_size", "80",
+            # 80 ms war zu knapp bemessen: sobald Bildschirmaufnahme +
+            # Encoding kurzzeitig mehr CPU-Zeit brauchen (normal, gerade
+            # bei langsameren Encoder-Presets), lief der dshow-Puffer
+            # dabei ueber - hoerbar als starke Verzerrung/Knacken in der
+            # Audiospur, und im schlimmsten Fall bricht der Audio-Stream
+            # dabei komplett ab (siehe -shortest weiter unten, das dann
+            # die GESAMTE Aufnahme auf wenige KB zusammenstutzt). 500 ms
+            # ist FFmpegs eigener Standardwert fuer dshow und deutlich
+            # toleranter gegenueber kurzen CPU-Spitzen - die dadurch
+            # etwas hoehere Aufnahmelatenz spielt bei einem Rekorder
+            # (anders als bei Livestreaming) keine Rolle.
+            "-audio_buffer_size", "500",
             "-i", f"audio={audio_device}",
         ]
 
@@ -289,16 +300,26 @@ def build_audio_input_args(audio_device: str | None) -> list:
 def _build_audio_filter_args(gain: float, denoise: bool) -> list:
     """
     Baut eine optionale '-af'-Filterkette für die Mikrofon-Aufnahme:
-      - afftdn:  einfache Rauschunterdrückung (Wunsch: "Performance vom Mikro")
-      - volume:  digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
+      - afftdn:    einfache Rauschunterdrückung (Wunsch: "Performance vom Mikro")
+      - volume:    digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
+      - alimiter:  Sicherheitsnetz GEGEN digitales Clipping (siehe unten)
     Wird nur angehängt, wenn tatsächlich etwas zu verändern ist - eine
     leere Filterkette würde FFmpeg unnötig zusätzliche Arbeit aufbürden.
     """
     filters = []
     if denoise:
         filters.append("afftdn")
+    boosted = gain is not None and gain > 1.0 + 0.005
     if gain is not None and abs(gain - 1.0) > 0.005:
         filters.append(f"volume={gain:.3f}")
+    if boosted:
+        # Ohne Begrenzer fuehrt "volume" bei Werten > 1.0 (Regler geht bis
+        # 3x = +9.5 dB) auf einem bereits normal ausgesteuerten Mikrofon
+        # fast zwangslaeufig zu hartem digitalem Clipping - genau das vom
+        # Nutzer gemeldete "klingt nur noch super verzerrt". alimiter
+        # deckelt Spitzen sanft VOR der Vollaussteuerung, statt sie
+        # abzuschneiden, und wird nur aktiv, wenn ueberhaupt verstaerkt wird.
+        filters.append("alimiter=limit=0.95")
     return ["-af", ",".join(filters)] if filters else []
 
 
@@ -433,8 +454,17 @@ def build_record_command(
         fps=fps,
     )
 
-    if has_audio and not audio_only:
-        cmd += ["-shortest"]
+    # ABSICHTLICH KEIN "-shortest" mehr: Video- und Audio-Input laufen beide
+    # durchgehend und werden gemeinsam per 'q' beendet, sollten also ohnehin
+    # fast exakt gleich lang sein. "-shortest" beendet die GESAMTE Ausgabe
+    # aber sofort, sobald IRGENDEIN Stream endet - bricht z. B. unter
+    # Windows kurzzeitig der dshow-Audio-Stream ab (Puffer-Überlauf,
+    # Gerät kurz belegt o. ä.), stutzt das die komplette, ansonsten
+    # einwandfrei laufende Videoaufnahme auf wenige Sekunden/KB zusammen,
+    # OHNE dass FFmpeg dabei einen Fehler meldet (sauberer Exit-Code) -
+    # genau das vom Nutzer gemeldete Symptom "Aufnahme nur ein paar KB
+    # groß". Ohne "-shortest" bleibt die Videospur in so einem Fall
+    # vollständig erhalten, die Audiospur endet dann eben etwas früher.
 
     cmd.append(output_path)
     return cmd
