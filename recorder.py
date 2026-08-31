@@ -114,6 +114,23 @@ class RecorderThread(threading.Thread):
         """Signalisiert dem Thread, die Aufnahme sauber zu beenden."""
         self._stop_event.set()
 
+    def force_kill(self):
+        """
+        LETZTE INSTANZ, ausschliesslich fuer den Fall, dass der GUI-Thread
+        beim Beenden der App nicht mehr auf die vollstaendige _graceful_stop()
+        warten kann/will (siehe gui_main._on_close): toetet den FFmpeg-Prozess
+        SOFORT, ohne auf das MOOV-Atom-Finalisieren zu warten - die Datei
+        kann danach beschaedigt/unvollstaendig sein. Sicher von einem
+        ANDEREN Thread aus aufrufbar, auch waehrend _graceful_stop() selbst
+        noch laeuft (Popen.kill()/.wait() auf einem bereits beendeten
+        Prozess ist ein no-op, keine Race-Condition).
+        """
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.kill()
+            except Exception:
+                pass
+
     # ==================================================================
     # THREAD-HAUPTSCHLEIFE  (nur EINMAL definiert!)
     # ==================================================================
@@ -130,6 +147,12 @@ class RecorderThread(threading.Thread):
                 audio_only=self.settings.get("audio_only", False),
                 gain=self.settings.get("gain", 1.0),
                 denoise=self.settings.get("denoise", False),
+                # Vom GUI-Thread VOR dem Threadstart ermittelt (siehe
+                # gui_main._start_recording) - build_video_input_args()
+                # darf get_screen_size() nicht selbst aufrufen, das würde
+                # aus diesem Worker-Thread heraus ein zweites Tk-Root
+                # erzeugen (siehe platform_utils.get_screen_size-Docstring).
+                screen_size=self.settings.get("screen_size"),
             )
 
             self._process = subprocess.Popen(

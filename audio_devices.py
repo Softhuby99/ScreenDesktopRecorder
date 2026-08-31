@@ -226,6 +226,14 @@ def list_meter_devices() -> list[tuple[str, int]]:
     eigentliche Aufnahme zwingend exakt stimmen müssen. PortAudio vergibt
     eigene Indizes/Namen, die davon abweichen können - für eine reine
     Pegel-Vorschau (nicht für die Aufnahme selbst) reicht das aber aus.
+
+    Anzeigenamen werden hier bewusst EINDEUTIG gemacht (" (2)", " (3)", ...
+    bei Duplikaten): PortAudio listet dieselbe Hardware unter Windows oft
+    mehrfach mit identischem Namen (einmal pro Host-API: MME/DirectSound/
+    WASAPI/WDM-KS). Die GUI matcht Geräte anhand dieses Namens
+    (_index_for_meter_name) - bei doppelten Namen würde sie sonst immer
+    auf den ERSTEN Treffer zurückfallen, wodurch alle weiteren gleichnamigen
+    Einträge im Dropdown zwar sichtbar, aber nie wirklich auswählbar wären.
     """
     try:
         import sounddevice as sd
@@ -233,10 +241,14 @@ def list_meter_devices() -> list[tuple[str, int]]:
         return []
 
     results: list[tuple[str, int]] = []
+    seen: dict[str, int] = {}
     try:
         for idx, device in enumerate(sd.query_devices()):
             if device.get("max_input_channels", 0) > 0:
                 name = str(device.get("name", "")).strip() or f"Gerät {idx}"
+                seen[name] = seen.get(name, 0) + 1
+                if seen[name] > 1:
+                    name = f"{name} ({seen[name]})"
                 results.append((name, idx))
     except Exception:
         return []
@@ -247,6 +259,24 @@ _SYSTEM_AUDIO_KEYWORDS = (
     "monitor", "stereo mix", "stereo-mix", "stereomix",
     "what u hear", "wave out", "loopback", "summe", "systemton",
 )
+
+
+def looks_like_system_audio(label: str) -> bool:
+    """
+    Erkennt anhand des GERÄTENAMENS (nicht anhand eines Emoji-Präfixes!),
+    ob ein Anzeigename nach Systemton/Monitor/Loopback aussieht.
+
+    Wichtig: list_pulse_sources() (Linux) markiert Systemton-Quellen mit
+    einem "🔊"-Präfix, aber list_dshow_audio_devices() (Windows) und
+    list_sounddevice_inputs() (Fallback) prefixen AUSNAHMSLOS alles mit
+    "🎤" - auch Stereo-Mix/Loopback-Geräte. Ein reiner Emoji-Check wäre
+    also unter Windows immer falsch. Deshalb hier stattdessen dieselbe
+    Stichwortliste wie list_meter_devices()/guess_speaker_monitor_default
+    direkt auf den (Klartext-)Namen anwenden - funktioniert plattform-
+    unabhängig, unabhängig vom jeweiligen Emoji-Präfix.
+    """
+    low = label.lower()
+    return any(kw in low for kw in _SYSTEM_AUDIO_KEYWORDS)
 
 
 def guess_microphone_default(devices: list[tuple[str, int]]) -> int | None:

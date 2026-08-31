@@ -106,12 +106,26 @@ def has_x11_compositor() -> bool:
 # ============================================================================
 # 2) BILDSCHIRMAUFLÖSUNG ERMITTELN
 # ============================================================================
+def even_dimensions(width: int, height: int) -> tuple[int, int]:
+    """Rundet auf gerade Zahlen ab (Pflicht für yuv420p-Subsampling)."""
+    return (width - width % 2, height - height % 2)
+
+
 def get_screen_size(fallback=(1920, 1080)) -> tuple[int, int]:
     """
-    Ermittelt die primäre Bildschirmauflösung.
+    Ermittelt die primäre Bildschirmauflösung über ein eigenes,
+    kurzlebiges Tk-Root.
 
-    Nutzt Tkinter (immer vorhanden, da GUI-Framework),
-    fällt bei Fehlern auf einen Standardwert zurück.
+    NUR VOM GUI-/HAUPTTHREAD AUFRUFEN! Tkinter/Tcl ist nicht dafür gebaut,
+    aus mehreren Threads gleichzeitig verwendet zu werden - ein zweites
+    Tk() aus einem Worker-Thread zu erzeugen, während im Hauptthread
+    bereits eine mainloop() läuft, kann zu Abstürzen/Hängern führen.
+    RecorderThread/BenchmarkThread rufen deshalb NICHT diese Funktion auf,
+    sondern bekommen die Bildschirmgröße als bereits vom Hauptthread
+    ermittelten Wert übergeben (siehe gui_main._current_screen_size() und
+    den screen_size-Parameter von build_record_command/build_benchmark_command).
+    Diese Funktion bleibt als eigenständiger Fallback bestehen, falls kein
+    screen_size übergeben wird.
     """
     try:
         import tkinter as tk
@@ -120,8 +134,7 @@ def get_screen_size(fallback=(1920, 1080)) -> tuple[int, int]:
         width = root.winfo_screenwidth()
         height = root.winfo_screenheight()
         root.destroy()
-        # Gerade Zahlen erzwingen (Pflicht für yuv420p)
-        return (width - width % 2, height - height % 2)
+        return even_dimensions(width, height)
     except Exception:
         return fallback
 

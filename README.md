@@ -61,6 +61,7 @@ installiert alle Abhängigkeiten sowie PyInstaller und baut
 | `region_selector.py` | Bereichsauswahl-Overlay |
 | `platform_utils.py` | Betriebssystem-Abstraktion (Windows/Linux/macOS) |
 | `config.py` | Zentrale Konstanten (Farben, Encoding-Presets, Benchmark-Matrix) |
+| `optimizer.py` | Nachträgliche Verkleinerung fertiger Videodateien (Thread) |
 
 ## Video- und Audio-Tab
 
@@ -77,3 +78,24 @@ Das Hauptfenster ist in zwei Tabs aufgeteilt:
 
 Welcher der beiden Tabs gerade offen ist, bestimmt, was der
 "Start"-Button unten aufnimmt.
+
+## Video nachträglich verkleinern
+
+Im Video-Tab gibt es unterhalb der eigentlichen Aufnahmeeinstellungen die
+Karte "Video verkleinern (nachträglich)". Damit lässt sich eine bereits
+aufgenommene Videodatei erneut durch FFmpeg schicken und deutlich
+kleiner machen, ohne die Originaldatei zu verändern (die verkleinerte
+Version landet als `<name>_optimiert.mp4` daneben).
+
+Der Grund, warum das überhaupt etwas bringt: Während der Live-Aufnahme
+muss FFmpeg mit einem sehr schnellen Preset (`ultrafast` bis `faster`)
+kodieren, damit die Aufnahme in Echtzeit mithält - das kostet spürbar
+Dateigröße. Bei der nachträglichen Verarbeitung gibt es diesen
+Zeitdruck nicht mehr, sodass ein viel langsameres, effizienteres
+Preset (und optional ein moderneren Codec) bei gleicher CRF-Qualität
+eine deutlich kleinere Datei erzeugt.
+
+Drei auswählbare Methoden ("Ausgewogen", "Kleiner (H.265)", "Maximale
+Einsparung (H.265, langsam)") - Details siehe Antwort im Chat bzw. die
+Beschreibungstexte direkt in der App. Der Fortschritt wird prozentual
+angezeigt, ein laufender Vorgang lässt sich jederzeit abbrechen.

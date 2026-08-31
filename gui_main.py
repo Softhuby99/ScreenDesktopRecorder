@@ -22,6 +22,7 @@ eingereiht wird.
 
 import os
 import threading
+import time
 from datetime import datetime
 from tkinter import filedialog, messagebox
 
@@ -29,14 +30,14 @@ import customtkinter as ctk
 
 from audio_devices import (
     get_audio_sources, guess_microphone_default, guess_speaker_monitor_default,
-    list_meter_devices,
+    list_meter_devices, looks_like_system_audio,
 )
 from audio_meter import LevelMeter
 from benchmark import BenchmarkThread
 from config import (
     APP_NAME, APP_VERSION, AUDIO_ONLY_EXTENSION,
     COLOR_ACCENT, COLOR_ACCENT_HOVER, COLOR_BG_CARD, COLOR_BG_HOVER,
-    COLOR_BG_INPUT, COLOR_BG_MAIN, COLOR_DANGER, COLOR_SUCCESS,
+    COLOR_BG_INPUT, COLOR_BG_MAIN, COLOR_DANGER, COLOR_DANGER_HOVER, COLOR_SUCCESS,
     COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY, COLOR_WARNING,
     DEFAULT_ENCODER, DEFAULT_FPS, DEFAULT_PRESET,
     ENCODER_OPTIONS, FPS_OPTIONS,
@@ -47,9 +48,10 @@ from config import (
 )
 from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpeg_path
 from gui_mini import MiniPanel
+from optimizer import OPTIMIZE_PROFILES, OptimizeThread, get_profile, suggest_output_path
 from gui_widgets import LevelMeterBar
 from platform_utils import (
-    get_default_videos_dir, get_platform_warning,
+    IS_WINDOWS, even_dimensions, get_default_videos_dir, get_platform_warning,
     open_file_manager,
 )
 from recorder import RecorderThread
@@ -84,8 +86,13 @@ class MainWindow(ctk.CTk):
         self._timer_job = None
         self._blink_state = True
 
+        # Video nachträglich verkleinern (siehe optimizer.py/_build_optimize_card)
+        self._optimize_input_path: str | None = None
+        self._optimize_thread: OptimizeThread | None = None
+
         # Mikrofon-/Lautsprecher-Vorschau (Audio-Tab)
         self._meter_devices: list[tuple[str, int]] = []
+        self._active_audio_only = False  # siehe _start_recording/_on_recording_started
         self._mic_level_meter: LevelMeter | None = None
         self._speaker_level_meter: LevelMeter | None = None
         self._meter_poll_job = None
@@ -204,7 +211,7 @@ class MainWindow(ctk.CTk):
             bench_card,
             text="Noch nicht getestet – Standardeinstellungen aktiv.",
             font=("Segoe UI", 11), text_color=COLOR_TEXT_MUTED,
-            wraplength=460, justify="left",
+            wraplength=410, justify="left",
         )
         self.bench_status.pack(fill="x", padx=14, pady=(0, 14))
 
@@ -228,6 +235,22 @@ class MainWindow(ctk.CTk):
             text_color=COLOR_ACCENT, anchor="w",
         )
         self.region_label.pack(fill="x", padx=14)
+
+        if IS_WINDOWS:
+            # Windows' gdigrab nimmt im Vollbild-Modus IMMER die gesamte
+            # virtuelle Anzeige auf - bei mehreren Monitoren also alle
+            # zusammen als ein (entsprechend breites/hohes) Video, nicht
+            # nur den Hauptbildschirm. Das ist für die meisten Nutzer nicht
+            # offensichtlich, deshalb hier einmalig als Hinweis sichtbar
+            # (nicht erst nach dem Start als Überraschung im fertigen Video).
+            ctk.CTkLabel(
+                settings_card,
+                text="ℹ  \"Vollbild\" nimmt bei mehreren Monitoren alle "
+                     "zusammen auf. Nur einen Bildschirm? \"Bereich\" wählen "
+                     "und den gewünschten Monitor aufziehen.",
+                font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+                anchor="w", wraplength=410, justify="left",
+            ).pack(fill="x", padx=14, pady=(0, 4))
 
         # Framerate
         self.fps_var = ctk.StringVar(value=DEFAULT_FPS)
@@ -288,6 +311,81 @@ class MainWindow(ctk.CTk):
         # Mikrofon-Vorschau synchron (siehe _on_audio_source_change).
         self.audio_var.trace_add("write", self._on_audio_source_change)
 
+        self._build_optimize_card(scroll)
+
+    def _build_optimize_card(self, parent):
+        """
+        Nachträgliche Verkleinerung EINER bereits fertigen Videodatei -
+        unabhängig von der eigentlichen Aufnahme (siehe optimizer.py).
+        Läuft komplett separat vom Aufnahme-Start/Stop-Mechanismus, hat
+        also einen eigenen Button/Fortschrittsbalken/Re-Entrancy-Schutz.
+        """
+        card = self._make_card(parent)
+        self._card_title(card, "Video verkleinern (nachträglich)")
+
+        ctk.CTkLabel(
+            card,
+            text="Kodiert eine bereits aufgenommene Datei mit einem "
+                 "langsameren, effizienteren Verfahren neu - deutlich "
+                 "kleinere Datei, ohne die Bildqualität sichtbar zu "
+                 "verschlechtern. Die Originaldatei bleibt unverändert "
+                 "erhalten, es entsteht eine neue Datei daneben.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+            anchor="w", wraplength=410, justify="left",
+        ).pack(fill="x", padx=14, pady=(0, 10))
+
+        row = self._labeled_row(card, "Datei")
+        self.optimize_file_label = ctk.CTkLabel(
+            row, text="Keine Datei gewählt", font=("Segoe UI", 12),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        )
+        self.optimize_file_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            row, text="Wählen …", width=90, height=30,
+            corner_radius=RADIUS_SM, fg_color=COLOR_BG_INPUT,
+            hover_color=COLOR_BG_HOVER, font=("Segoe UI", 12),
+            command=self._choose_optimize_file,
+        ).pack(side="right")
+
+        row = self._labeled_row(card, "Methode")
+        self.optimize_profile_var = ctk.StringVar(value=OPTIMIZE_PROFILES[0]["label"])
+        ctk.CTkOptionMenu(
+            row, values=[p["label"] for p in OPTIMIZE_PROFILES],
+            variable=self.optimize_profile_var,
+            width=250, height=34, corner_radius=RADIUS_SM,
+            fg_color=COLOR_BG_INPUT, button_color=COLOR_BG_INPUT,
+            button_hover_color=COLOR_BG_HOVER, font=("Segoe UI", 12),
+            command=self._on_optimize_profile_change,
+        ).pack(side="right", fill="x", expand=True)
+
+        self.optimize_profile_desc = ctk.CTkLabel(
+            card, text=OPTIMIZE_PROFILES[0]["description"],
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+            anchor="w", wraplength=410, justify="left",
+        )
+        self.optimize_profile_desc.pack(fill="x", padx=14, pady=(0, 10))
+
+        self.optimize_progress = ctk.CTkProgressBar(
+            card, height=10, corner_radius=RADIUS_SM,
+            fg_color=COLOR_BG_INPUT, progress_color=COLOR_ACCENT,
+        )
+        self.optimize_progress.set(0)
+        self.optimize_progress.pack(fill="x", padx=14, pady=(0, 6))
+
+        self.optimize_status = ctk.CTkLabel(
+            card, text="", font=("Segoe UI", 11),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        )
+        self.optimize_status.pack(fill="x", padx=14, pady=(0, 10))
+
+        self.optimize_btn = ctk.CTkButton(
+            card, text="🗜  Video verkleinern", height=36,
+            corner_radius=RADIUS_SM, fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER, font=("Segoe UI", 12, "bold"),
+            command=self._start_optimize,
+        )
+        self.optimize_btn.pack(fill="x", padx=14, pady=(0, 14))
+
     def _build_audio_tab(self, parent):
         scroll = ctk.CTkScrollableFrame(
             parent, fg_color="transparent",
@@ -303,13 +401,18 @@ class MainWindow(ctk.CTk):
 
         row = self._labeled_row(mic_card, "Aufnahmequelle")
         # Dieselbe StringVar wie das "Audio-Quelle"-Dropdown im Video-Tab -
-        # eine Auswahl gilt für beide Tabs, kein doppelter Zustand.
-        ctk.CTkOptionMenu(
+        # eine Auswahl gilt für beide Tabs, kein doppelter Zustand. Die
+        # Werteliste (values=) wird von jedem CTkOptionMenu SEPARAT
+        # verwaltet, auch wenn beide dieselbe Variable teilen - deshalb
+        # als self.audio_menu_audio_tab merken, damit _apply_audio_devices()
+        # auch dieses zweite Dropdown befüllen kann (siehe dort).
+        self.audio_menu_audio_tab = ctk.CTkOptionMenu(
             row, values=[NO_AUDIO_LABEL], variable=self.audio_var,
             width=250, height=34, corner_radius=RADIUS_SM,
             fg_color=COLOR_BG_INPUT, button_color=COLOR_BG_INPUT,
             button_hover_color=COLOR_BG_HOVER, font=("Segoe UI", 12),
-        ).pack(side="right", fill="x", expand=True)
+        )
+        self.audio_menu_audio_tab.pack(side="right", fill="x", expand=True)
 
         self.mic_meter = LevelMeterBar(mic_card, height=22)
         self.mic_meter.pack(fill="x", padx=14, pady=(6, 12))
@@ -334,7 +437,7 @@ class MainWindow(ctk.CTk):
             text="Wirkt nur auf die Aufnahme (die Vorschau oben zeigt den "
                  "unveränderten Rohpegel).",
             font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
-            anchor="w", wraplength=460, justify="left",
+            anchor="w", wraplength=410, justify="left",
         ).pack(fill="x", padx=14)
 
         self.denoise_var = ctk.BooleanVar(value=False)
@@ -365,7 +468,7 @@ class MainWindow(ctk.CTk):
         self.speaker_hint = ctk.CTkLabel(
             speaker_card, text="",
             font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
-            anchor="w", wraplength=460, justify="left",
+            anchor="w", wraplength=410, justify="left",
         )
         self.speaker_hint.pack(fill="x", padx=14, pady=(0, 14))
 
@@ -454,6 +557,18 @@ class MainWindow(ctk.CTk):
     def _set_status(self, text: str, color: str = COLOR_TEXT_MUTED):
         self.status_label.configure(text=text, text_color=color)
 
+    def _current_screen_size(self) -> tuple[int, int]:
+        """
+        Ermittelt die Bildschirmauflösung ÜBER DAS BEREITS VORHANDENE
+        Hauptfenster (self) statt ein zweites Tk-Root zu öffnen wie
+        platform_utils.get_screen_size() es täte. WICHTIG: nur vom
+        GUI-Thread aus aufrufen (self.winfo_...() ist Tkinter) - das
+        Ergebnis wird dann an RecorderThread/BenchmarkThread als fertiger
+        Wert übergeben, damit diese Worker-Threads selbst NIE Tkinter
+        anfassen müssen (siehe platform_utils.get_screen_size-Docstring).
+        """
+        return even_dimensions(self.winfo_screenwidth(), self.winfo_screenheight())
+
     def _on_tab_change(self):
         active = self.tabview.get()
         if active == TAB_AUDIO:
@@ -492,9 +607,32 @@ class MainWindow(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _apply_audio_devices(self, sources: list):
-        self.audio_map = {display: ident for display, ident in sources}
-        values = [NO_AUDIO_LABEL] + list(self.audio_map.keys())
+        # WICHTIG: NICHT direkt {display: ident for display, ident in sources}
+        # - zwei Geräte mit identischem Anzeigenamen (z. B. zwei baugleiche
+        # USB-Mikrofone, oder zwei DirectShow-Geräte mit generischem Namen
+        # wie "Mikrofon (USB Audio Device)") würden sich sonst im Dict
+        # gegenseitig überschreiben: das Dropdown zeigt dann nur EINEN
+        # Eintrag, und das erste der beiden echten Geräte wäre dauerhaft
+        # nicht auswählbar. Deshalb werden doppelte Anzeigenamen hier mit
+        # " (2)", " (3)", ... eindeutig gemacht, bevor sie in die Map
+        # wandern - die zugrunde liegende FFmpeg-ID bleibt dabei pro Gerät
+        # exakt erhalten.
+        self.audio_map = {}
+        seen: dict[str, int] = {}
+        display_values = []
+        for display, ident in sources:
+            seen[display] = seen.get(display, 0) + 1
+            unique_display = display if seen[display] == 1 else f"{display} ({seen[display]})"
+            self.audio_map[unique_display] = ident
+            display_values.append(unique_display)
+        values = [NO_AUDIO_LABEL] + display_values
+        # Beide Dropdowns (Video-Tab UND Audio-Tab) teilen zwar dieselbe
+        # StringVar, aber .configure(values=...) muss auf JEDEM der beiden
+        # Widgets einzeln aufgerufen werden - sonst bleibt das zweite in
+        # seiner Popup-Liste beim Startwert hängen, obwohl der angezeigte
+        # Text (über die gemeinsame Variable) korrekt aktualisiert wirkt.
         self.audio_menu.configure(values=values)
+        self.audio_menu_audio_tab.configure(values=values)
         self.audio_var.set(NO_AUDIO_LABEL)
 
     # ==================================================================
@@ -565,7 +703,12 @@ class MainWindow(ctk.CTk):
         geändert wurde.
         """
         label = self.audio_var.get()
-        is_system_audio = label.startswith("🔊")
+        # looks_like_system_audio() prüft Stichworte im Klartext-Namen,
+        # nicht nur ein Emoji-Präfix - auf Windows/Fallback beginnen sonst
+        # ALLE Geräte (auch Stereo Mix/Loopback) mit "🎤", wodurch die
+        # Vorschau dort fälschlich immer die Mikrofon-Kategorie annehmen
+        # würde (siehe Modul-Kommentar in audio_devices.looks_like_system_audio).
+        is_system_audio = looks_like_system_audio(label)
         idx = (
             guess_speaker_monitor_default(self._meter_devices) if is_system_audio
             else guess_microphone_default(self._meter_devices)
@@ -710,7 +853,18 @@ class MainWindow(ctk.CTk):
                 available = check_fn(encoder)
             except Exception:
                 available = False
-            self.after(0, self._apply_encoder_check, encoder, available, fallback_msg, success_text)
+            # Falls die App inzwischen geschlossen wurde (self.destroy()
+            # bereits gelaufen), waere self.after(...) hier ein Zugriff auf
+            # ein bereits zerstoertes Tk-Fenster - dieser (daemon-)Thread
+            # wird dadurch nicht selbst zum Problem (der zugrunde liegende
+            # FFmpeg-Testlauf ist ueber sein eigenes subprocess.run(timeout=...)
+            # ohnehin spaetestens nach ~10s garantiert beendet), aber ohne
+            # dieses try/except wuerde eine Exception im Hintergrund-Thread
+            # als Traceback auf stderr landen.
+            try:
+                self.after(0, self._apply_encoder_check, encoder, available, fallback_msg, success_text)
+            except Exception:
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -736,6 +890,132 @@ class MainWindow(ctk.CTk):
             self.path_var.set(folder)
 
     # ==================================================================
+    # VIDEO NACHTRÄGLICH VERKLEINERN (siehe optimizer.py)
+    # ==================================================================
+    def _choose_optimize_file(self):
+        path = filedialog.askopenfilename(
+            title="Videodatei wählen",
+            filetypes=[
+                ("Videodateien", "*.mp4 *.mov *.mkv *.avi"),
+                ("Alle Dateien", "*.*"),
+            ],
+        )
+        if path:
+            self._set_optimize_file(path)
+
+    def _set_optimize_file(self, path: str):
+        """
+        Setzt die Zieldatei fürs Verkleinern - sowohl per manueller Auswahl
+        (_choose_optimize_file) als auch automatisch nach einer fertigen
+        Video-Aufnahme (siehe _on_recording_stopped), damit der naheliegende
+        Ablauf "gerade aufgenommen -> gleich verkleinern" keinen Umweg über
+        den Dateidialog braucht.
+        """
+        self._optimize_input_path = path
+        self.optimize_file_label.configure(
+            text=os.path.basename(path), text_color=COLOR_TEXT_PRIMARY,
+        )
+
+    def _on_optimize_profile_change(self, label: str):
+        profile = next((p for p in OPTIMIZE_PROFILES if p["label"] == label), None)
+        if profile:
+            self.optimize_profile_desc.configure(text=profile["description"])
+
+    def _start_optimize(self):
+        # Re-Entrancy-Schutz, gleiches Prinzip wie bei _start_recording:
+        # ein zweiter Klick waehrend eine Optimierung schon laeuft wuerde
+        # sonst einen zweiten, konkurrierenden FFmpeg-Prozess auf dieselbe
+        # Ausgabedatei starten.
+        if self._optimize_thread is not None and self._optimize_thread.is_alive():
+            return
+
+        if not self._optimize_input_path or not os.path.isfile(self._optimize_input_path):
+            messagebox.showwarning(
+                "Keine Datei", "Bitte zuerst eine Videodatei auswählen.",
+            )
+            return
+
+        profile = get_profile(self._profile_id_for_label(self.optimize_profile_var.get()))
+        output_path = suggest_output_path(self._optimize_input_path)
+
+        self.optimize_btn.configure(
+            text="✕  Abbrechen", fg_color=COLOR_DANGER, hover_color=COLOR_DANGER_HOVER,
+            command=self._cancel_optimize,
+        )
+        self.optimize_progress.set(0)
+        self.optimize_status.configure(
+            text="Starte Optimierung …", text_color=COLOR_TEXT_MUTED,
+        )
+
+        self._optimize_thread = OptimizeThread(
+            self._optimize_input_path, output_path, profile,
+            on_progress=lambda p: self.after(0, self._on_optimize_progress, p),
+            on_finish=lambda out, orig, new: self.after(0, self._on_optimize_finish, out, orig, new),
+            on_error=lambda m: self.after(0, self._on_optimize_error, m),
+        )
+        self._optimize_thread.start()
+
+    def _profile_id_for_label(self, label: str) -> str:
+        for profile in OPTIMIZE_PROFILES:
+            if profile["label"] == label:
+                return profile["id"]
+        return OPTIMIZE_PROFILES[0]["id"]
+
+    def _cancel_optimize(self):
+        if self._optimize_thread:
+            self._optimize_thread.cancel()
+        self.optimize_status.configure(text="Wird abgebrochen …", text_color=COLOR_TEXT_MUTED)
+        self.optimize_btn.configure(state="disabled")
+        self.after(200, self._poll_optimize_cancelled)
+
+    def _poll_optimize_cancelled(self):
+        if self._optimize_thread and self._optimize_thread.is_alive():
+            self.after(200, self._poll_optimize_cancelled)
+            return
+        self.optimize_status.configure(text="Abgebrochen.", text_color=COLOR_TEXT_MUTED)
+        self.optimize_progress.set(0)
+        self._reset_optimize_button()
+
+    def _on_optimize_progress(self, percent: float | None):
+        if percent is None:
+            self.optimize_status.configure(text="Wird verkleinert …")
+            return
+        self.optimize_progress.set(percent / 100)
+        self.optimize_status.configure(text=f"Wird verkleinert … {percent:.0f} %")
+
+    def _on_optimize_finish(self, output_path: str, original_bytes: int, new_bytes: int):
+        self.optimize_progress.set(1.0)
+        self._reset_optimize_button()
+
+        orig_mb = original_bytes / (1024 * 1024)
+        new_mb = new_bytes / (1024 * 1024)
+        saved_pct = (1 - new_bytes / original_bytes) * 100 if original_bytes else 0.0
+        self.optimize_status.configure(
+            text=f"✓ {orig_mb:.1f} MB → {new_mb:.1f} MB  ({saved_pct:.0f} % kleiner)",
+            text_color=COLOR_SUCCESS,
+        )
+        if messagebox.askyesno(
+            "Verkleinerung fertig",
+            f"Neue Datei:\n{os.path.basename(output_path)}\n\n"
+            f"{orig_mb:.1f} MB → {new_mb:.1f} MB  ({saved_pct:.0f} % kleiner)\n\n"
+            "Ordner jetzt öffnen?",
+        ):
+            open_file_manager(output_path)
+
+    def _on_optimize_error(self, message: str):
+        self._reset_optimize_button()
+        self.optimize_progress.set(0)
+        self.optimize_status.configure(text="Fehlgeschlagen.", text_color=COLOR_DANGER)
+        messagebox.showerror("Optimierung fehlgeschlagen", message[:600])
+
+    def _reset_optimize_button(self):
+        self.optimize_btn.configure(
+            state="normal", text="🗜  Video verkleinern",
+            fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+            command=self._start_optimize,
+        )
+
+    # ==================================================================
     # BENCHMARK
     # ==================================================================
     def _start_benchmark(self):
@@ -749,6 +1029,7 @@ class MainWindow(ctk.CTk):
             on_progress=lambda t: self.after(0, self._bench_progress, t),
             on_finish=lambda r: self.after(0, self._bench_finish, r),
             on_error=lambda m: self.after(0, self._bench_error, m),
+            screen_size=self._current_screen_size(),
         )
         self.benchmark_thread.start()
 
@@ -784,6 +1065,14 @@ class MainWindow(ctk.CTk):
     # AUFNAHME
     # ==================================================================
     def _start_recording(self):
+        # Re-Entrancy-Schutz: ohne dies würde ein Doppelklick innerhalb des
+        # kurzen Fensters, bis FFmpeg tatsächlich gestartet ist (_on_recording_started
+        # kommt asynchron erst nach dem Prozessstart), einen zweiten,
+        # verwaisten RecorderThread/FFmpeg-Prozess samt zweitem MiniPanel
+        # erzeugen. self.recorder ist nur zwischen Start und Stop gesetzt.
+        if self.recorder is not None:
+            return
+
         folder = self.path_var.get().strip()
         if not os.path.isdir(folder):
             messagebox.showerror("Ungültiger Pfad", "Der Speicherort existiert nicht.")
@@ -826,7 +1115,18 @@ class MainWindow(ctk.CTk):
             "audio_only": audio_only,
             "gain": self.mic_gain_var.get(),
             "denoise": self.denoise_var.get(),
+            # Auf dem GUI-Thread ermittelt - siehe _current_screen_size().
+            "screen_size": self._current_screen_size(),
         }
+
+        # Für _on_recording_started() (siehe dort): merken, WELCHER Modus
+        # tatsächlich in diesem FFmpeg-Kommando gelandet ist - der Nutzer
+        # kann den Tab ja theoretisch noch wechseln, bevor _on_recording_started
+        # (kommt asynchron ~0.8s später) feuert. Dort erneut self.tabview.get()
+        # abzufragen würde dann fälschlich den NEUEN Tab statt des tatsächlich
+        # aufgenommenen Modus anzeigen (nur die MiniPanel-Beschriftung wäre
+        # betroffen, nicht die Aufnahme selbst - aber trotzdem irreführend).
+        self._active_audio_only = audio_only
 
         # Vorschau-Geräte freigeben, BEVOR FFmpeg versucht, dieselbe
         # Audioquelle zu öffnen (siehe _pause_meters).
@@ -846,7 +1146,10 @@ class MainWindow(ctk.CTk):
         # Hauptfenster ausblenden -> spart RAM/CPU auf schwacher Hardware
         self.withdraw()
 
-        audio_only = self.tabview.get() == TAB_AUDIO
+        # Den tatsächlich aufgenommenen Modus verwenden (siehe _start_recording),
+        # NICHT erneut self.tabview.get() - der Tab könnte inzwischen
+        # gewechselt worden sein, während FFmpeg noch startete.
+        audio_only = self._active_audio_only
 
         self.mini_panel = MiniPanel(
             self, fps=self.fps_var.get(),
@@ -899,6 +1202,12 @@ class MainWindow(ctk.CTk):
                 f"✓ Gespeichert: {os.path.basename(path)}  ({size_mb:.1f} MB)",
                 COLOR_SUCCESS,
             )
+            # Nur bei echten VIDEO-Aufnahmen als Vorauswahl für "Video
+            # verkleinern" übernehmen - eine reine .m4a-Tonaufnahme hat
+            # keinen Videostream, den die Optimierungsprofile (allesamt
+            # Video-Encoder) verarbeiten könnten.
+            if not self._active_audio_only:
+                self._set_optimize_file(path)
             if messagebox.askyesno(
                 "Aufnahme fertig",
                 f"Datei gespeichert:\n{os.path.basename(path)}  ({size_mb:.1f} MB)\n\n"
@@ -913,6 +1222,45 @@ class MainWindow(ctk.CTk):
         self._set_status(short, COLOR_DANGER)
         messagebox.showerror("Aufnahmefehler", message[:600])
 
+    def _wait_for_recorder_shutdown(self):
+        """
+        Wartet auf das Ende von RecorderThread, OHNE dabei die komplette
+        Tk-Ereignisschleife zu blockieren wie ein einzelnes langes join()
+        es taete.
+
+        RecorderThread._graceful_stop() hat selbst ein Eskalations-Budget
+        von bis zu ~18s (wait 10s -> terminate+wait 5s -> kill+wait 3s),
+        um FFmpeg das MOOV-Atom sauber finalisieren zu lassen. Ein reines
+        `self.recorder.join(timeout=20)` wuerde in dieser Zeit die
+        Ereignisschleife komplett anhalten - unter Windows fuehrt das
+        typischerweise dazu, dass das Fenster im Titel "(Keine Rückmeldung)"
+        anzeigt, obwohl im Hintergrund alles wie vorgesehen laeuft. Deshalb
+        hier stattdessen in kleinen Schritten warten und zwischendurch
+        self.update() aufrufen, WAEHREND eine Statuszeile anzeigt, dass
+        bewusst noch (kurz) gewartet wird.
+        """
+        self._set_status("Aufnahme wird finalisiert – bitte warten ...", COLOR_ACCENT)
+        try:
+            self.update()
+        except Exception:
+            pass
+
+        deadline = time.time() + 20
+        while self.recorder.is_alive() and time.time() < deadline:
+            self.recorder.join(timeout=0.2)
+            try:
+                self.update()
+            except Exception:
+                # Fenster wurde zwischenzeitlich zerstoert - nichts mehr zu tun.
+                break
+
+        if self.recorder.is_alive():
+            # Letzte Instanz: sollte in ~20s wirklich nichts geklappt haben
+            # (haengender Thread), FFmpeg hart beenden statt die App ewig
+            # offenzuhalten oder als Waisenprozess weiterlaufen zu lassen.
+            self.recorder.force_kill()
+            self.recorder.join(timeout=3)
+
     # ==================================================================
     def _on_close(self):
         if self.recorder and self.recorder.is_active:
@@ -922,7 +1270,7 @@ class MainWindow(ctk.CTk):
             ):
                 return
             self.recorder.stop()
-            self.recorder.join(timeout=8)
+            self._wait_for_recorder_shutdown()
 
         if self._meter_poll_job:
             self.after_cancel(self._meter_poll_job)
@@ -931,5 +1279,12 @@ class MainWindow(ctk.CTk):
 
         if self.benchmark_thread and self.benchmark_thread.is_alive():
             self.benchmark_thread.cancel()
+
+        if self._optimize_thread and self._optimize_thread.is_alive():
+            # Kein Datenverlust-Risiko wie bei einer laufenden Aufnahme (die
+            # Originaldatei bleibt so oder so unangetastet) - deshalb ohne
+            # Rückfrage einfach abbrechen; die unfertige Ausgabedatei räumt
+            # OptimizeThread.cancel() selbst auf.
+            self._optimize_thread.cancel()
 
         self.destroy()

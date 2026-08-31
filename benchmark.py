@@ -39,11 +39,14 @@ class BenchmarkThread(threading.Thread):
     :param on_error:    Callback(message: str) - Fehlerbehandlung
     """
 
-    def __init__(self, on_progress=None, on_finish=None, on_error=None):
+    def __init__(self, on_progress=None, on_finish=None, on_error=None, screen_size=None):
         super().__init__(daemon=True)
         self.on_progress = on_progress
         self.on_finish = on_finish
         self.on_error = on_error
+        # Vom GUI-Thread VOR dem Threadstart ermittelt - siehe
+        # gui_main._start_benchmark() und den Kommentar bei RecorderThread.
+        self._screen_size = screen_size
         self._process: subprocess.Popen | None = None
         self._cancelled = threading.Event()
 
@@ -74,7 +77,9 @@ class BenchmarkThread(threading.Thread):
         try:
             self._emit(self.on_progress, "Starte Testaufnahme ...")
 
-            cmd = build_benchmark_command(temp_file, BENCHMARK_DURATION, fps="30")
+            cmd = build_benchmark_command(
+                temp_file, BENCHMARK_DURATION, fps="30", screen_size=self._screen_size,
+            )
             self._process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,

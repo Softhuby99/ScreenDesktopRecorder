@@ -67,6 +67,14 @@ class RegionSelector:
         self.start_y = 0
         self.rect_id = None
         self.info_id = None
+        self._vroot_x = 0
+        self._vroot_y = 0
+        self._vw = 0
+        self._vh = 0
+        # Aktueller "zweiter Punkt" der Auswahl (Maus ODER Tastatur-Nudge) -
+        # siehe _on_drag()/_nudge_selection()/_confirm_via_keyboard().
+        self._cur_x = 0
+        self._cur_y = 0
 
         self._use_screenshot = False
         self._bg_photo = None  # Referenz muss gehalten werden (sonst GC!)
@@ -110,7 +118,19 @@ class RegionSelector:
         # erreicht optisch dasselbe, ohne diesen WM-Sonderfall auszuloesen.
         vw = self.window.winfo_vrootwidth() or self.window.winfo_screenwidth()
         vh = self.window.winfo_vrootheight() or self.window.winfo_screenheight()
-        self.window.geometry(f"{vw}x{vh}+0+0")
+        # WICHTIG fuer Multi-Monitor-Layouts, bei denen ein Bildschirm LINKS
+        # von oder OBERHALB des Hauptbildschirms liegt (unter Windows sehr
+        # gebraeuchlich): der virtuelle Desktop-Ursprung liegt dann NICHT
+        # bei (0,0), sondern ist negativ (z. B. -1920,0). Ein fest verdrahtetes
+        # "+0+0" wuerde das Overlay nur auf den Hauptbildschirm legen und
+        # den negativ liegenden Bildschirm komplett aussen vor lassen - der
+        # Nutzer koennte dort gar keinen Bereich auswaehlen. winfo_vrootx()/
+        # winfo_vrooty() liefern den echten (ggf. negativen) Ursprung; unter
+        # X11 ist das ueblicherweise 0.
+        self._vroot_x = self.window.winfo_vrootx()
+        self._vroot_y = self.window.winfo_vrooty()
+        self._vw, self._vh = vw, vh
+        self.window.geometry(f"{vw}x{vh}+{self._vroot_x}+{self._vroot_y}")
 
         self.canvas = tk.Canvas(
             self.window, bg=bg_color, highlightthickness=0, cursor="crosshair"
@@ -143,7 +163,10 @@ class RegionSelector:
 
         # Bedienhinweis mittig einblenden (mit dunklem Hintergrund-Chip,
         # damit er auf jedem Untergrund lesbar bleibt)
-        hint_text = "Bereich mit der Maus aufziehen  •  ESC = Abbrechen"
+        hint_text = (
+            "Bereich mit der Maus aufziehen  •  danach Pfeiltasten = verschieben, "
+            "Enter = übernehmen  •  ESC = Abbrechen"
+        )
         self.canvas.create_rectangle(
             vw // 2 - 260, 18, vw // 2 + 260, 62,
             fill="#000000", outline="", stipple="gray50",
@@ -160,6 +183,23 @@ class RegionSelector:
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.window.bind("<Escape>", self._on_cancel)
+
+        # Tastatur-Alternative (Barrierefreiheit): sobald per Maus EINMAL
+        # eine Auswahl aufgezogen wurde, kann sie mit den Pfeiltasten
+        # nachjustiert und mit Enter bestaetigt werden, ganz ohne die Maus
+        # ruhig halten und exakt loslassen zu muessen.
+        self.window.bind("<Return>", self._confirm_via_keyboard)
+        self.window.bind("<KP_Enter>", self._confirm_via_keyboard)
+        for key, dx, dy in (
+            ("<Left>", -1, 0), ("<Right>", 1, 0), ("<Up>", 0, -1), ("<Down>", 0, 1),
+        ):
+            self.window.bind(key, lambda _e, dx=dx, dy=dy: self._nudge_selection(dx, dy))
+        for key, dx, dy in (
+            ("<Shift-Left>", -10, 0), ("<Shift-Right>", 10, 0),
+            ("<Shift-Up>", 0, -10), ("<Shift-Down>", 0, 10),
+        ):
+            self.window.bind(key, lambda _e, dx=dx, dy=dy: self._nudge_selection(dx, dy))
+        self.window.focus_force()
 
         # Erst JETZT tatsaechlich anzeigen - Inhalt (Screenshot/Alpha)
         # steht zu diesem Zeitpunkt bereits vollstaendig fest.
@@ -234,6 +274,7 @@ class RegionSelector:
     # ------------------------------------------------------------------
     def _on_press(self, event):
         self.start_x, self.start_y = event.x, event.y
+        self._cur_x, self._cur_y = event.x, event.y
 
         if self._use_screenshot and self._dim_full:
             self.canvas.delete(self._dim_full)
@@ -254,30 +295,67 @@ class RegionSelector:
     def _on_drag(self, event):
         if not self.rect_id:
             return
-        self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
+        self._cur_x, self._cur_y = event.x, event.y
+        self._redraw_selection(show_info_near_cursor=True)
+
+    def _redraw_selection(self, show_info_near_cursor: bool = False):
+        """
+        Zeichnet Auswahlrechteck, Abdunkelung und Größenanzeige anhand von
+        (start_x, start_y) -> (_cur_x, _cur_y) neu. Gemeinsam genutzt von
+        Maus-Drag UND Tastatur-Nudge (_nudge_selection), damit beide Wege
+        optisch exakt gleich reagieren.
+        """
+        x2, y2 = self._cur_x, self._cur_y
+        self.canvas.coords(self.rect_id, self.start_x, self.start_y, x2, y2)
 
         if self._use_screenshot:
             vw = self.window.winfo_width()
             vh = self.window.winfo_height()
-            self._update_dim_rects(self.start_x, self.start_y, event.x, event.y, vw, vh)
+            self._update_dim_rects(self.start_x, self.start_y, x2, y2, vw, vh)
             self.canvas.tag_raise(self.rect_id)
 
-        # Live-Anzeige der Aufloesung neben dem Cursor
-        w = abs(event.x - self.start_x)
-        h = abs(event.y - self.start_y)
+        w = abs(x2 - self.start_x)
+        h = abs(y2 - self.start_y)
         label = f"{w} x {h} px"
 
         if self.info_id:
             self.canvas.delete(self.info_id)
+        info_x = x2 + 55 if show_info_near_cursor else min(self.start_x, x2)
+        info_y = y2 + 18 if show_info_near_cursor else max(self.start_y, y2) + 18
         self.info_id = self.canvas.create_text(
-            event.x + 55, event.y + 18,
+            info_x, info_y,
             text=label, fill="#FFFFFF", font=("Segoe UI", 11, "bold"),
         )
 
-    def _on_release(self, event):
-        x1, y1 = self.start_x, self.start_y
-        x2, y2 = event.x, event.y
+    def _nudge_selection(self, dx: int, dy: int):
+        """
+        Tastatur-Alternative zum Nachziehen mit der Maus: verschiebt die
+        GESAMTE bereits aufgezogene Auswahl (nicht nur eine Ecke) um
+        (dx, dy) Pixel, begrenzt auf die sichtbare Overlay-Fläche. Ohne
+        vorher per Maus gestartete Auswahl (kein rect_id) passiert nichts -
+        das Nudging ist eine Verfeinerung, kein Ersatz für den ersten Zug.
+        """
+        if not self.rect_id:
+            return
+        w = self._cur_x - self.start_x
+        h = self._cur_y - self.start_y
 
+        new_start_x = max(0, min(self.start_x + dx, self._vw - 1))
+        new_start_y = max(0, min(self.start_y + dy, self._vh - 1))
+        new_cur_x = max(0, min(new_start_x + w, self._vw))
+        new_cur_y = max(0, min(new_start_y + h, self._vh))
+        # Falls das Verschieben am Rand die Breite/Höhe gekappt hätte,
+        # lieber den Startpunkt nachjustieren statt die Auswahlgröße
+        # ungewollt zu verändern.
+        new_start_x = new_cur_x - w
+        new_start_y = new_cur_y - h
+
+        self.start_x, self.start_y = new_start_x, new_start_y
+        self._cur_x, self._cur_y = new_cur_x, new_cur_y
+        self._redraw_selection(show_info_near_cursor=False)
+
+    def _finish_selection(self, x1: int, y1: int, x2: int, y2: int):
+        """Gemeinsame Abschlusslogik für Maus-Loslassen UND Enter-Taste."""
         x = min(x1, x2)
         y = min(y1, y2)
         w = abs(x2 - x1)
@@ -290,9 +368,26 @@ class RegionSelector:
             # Gerade Zahlen erzwingen (Pflicht fuer yuv420p)
             w -= w % 2
             h -= h % 2
-            self.result = (x, y, w, h)
+            # x/y sind bisher relativ zur Overlay-Fensterecke (Canvas-lokale
+            # Koordinaten) - in ABSOLUTE Bildschirmkoordinaten umrechnen,
+            # indem der (ggf. negative) virtuelle Desktop-Ursprung wieder
+            # aufaddiert wird (siehe select()/winfo_vrootx()-Kommentar oben).
+            # Ohne dies waere die Auswahl auf einem links/oberhalb des
+            # Hauptbildschirms liegenden Monitor um genau diesen Betrag
+            # verschoben.
+            self.result = (x + self._vroot_x, y + self._vroot_y, w, h)
 
         self._close()
+
+    def _on_release(self, event):
+        self._finish_selection(self.start_x, self.start_y, event.x, event.y)
+
+    def _confirm_via_keyboard(self, _event=None):
+        """Enter/Kp_Enter: übernimmt die aktuelle (ggf. per Pfeiltasten
+        nachjustierte) Auswahl, ohne dass die Maus losgelassen werden muss."""
+        if not self.rect_id:
+            return
+        self._finish_selection(self.start_x, self.start_y, self._cur_x, self._cur_y)
 
     def _on_cancel(self, _event=None):
         self.result = None

@@ -46,12 +46,13 @@ class MiniPanel(ctk.CTkToplevel):
         self.resizable(False, False)
 
         # ---- Positionierung: oben mittig ----
-        width, height = 330, 60
+        self._width, self._height = 330, 60
         screen_w = self.winfo_screenwidth()
-        self.geometry(f"{width}x{height}+{(screen_w - width) // 2}+24")
+        self.geometry(f"{self._width}x{self._height}+{(screen_w - self._width) // 2}+24")
 
         self._build_ui()
         self._bind_drag()
+        self._bind_keys()
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -114,7 +115,33 @@ class MiniPanel(ctk.CTkToplevel):
         self._drag_y = event.y_root - self.winfo_y()
 
     def _drag_move(self, event):
-        self.geometry(f"+{event.x_root - self._drag_x}+{event.y_root - self._drag_y}")
+        new_x = event.x_root - self._drag_x
+        new_y = event.y_root - self._drag_y
+
+        # Innerhalb des virtuellen Desktops halten (nicht nur des
+        # Hauptbildschirms - siehe region_selector.py für denselben Ansatz
+        # bei Multi-Monitor-Layouts mit negativem Ursprung): ohne dies
+        # ließe sich das rahmenlose Panel komplett aus dem sichtbaren
+        # Bereich hinausziehen und wäre dann ohne Neustart der App nicht
+        # mehr erreichbar.
+        vx = self.winfo_vrootx()
+        vy = self.winfo_vrooty()
+        vw = self.winfo_vrootwidth() or self.winfo_screenwidth()
+        vh = self.winfo_vrootheight() or self.winfo_screenheight()
+
+        new_x = max(vx, min(new_x, vx + vw - self._width))
+        new_y = max(vy, min(new_y, vy + vh - self._height))
+
+        self.geometry(f"+{new_x}+{new_y}")
+
+    def _bind_keys(self):
+        """
+        Tastatur-Alternative zur (rein mausbasierten) Bedienung: Leertaste
+        pausiert/setzt fort, ohne dass der kleine Button getroffen werden
+        muss. Erfordert Tastaturfokus - deshalb focus_force() beim Erzeugen.
+        """
+        self.bind("<space>", lambda _e: self._handle_pause())
+        self.focus_force()
 
     # ------------------------------------------------------------------
     # ÖFFENTLICHE UPDATE-METHODEN (vom GUI-Thread aufgerufen)

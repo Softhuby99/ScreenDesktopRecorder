@@ -9,6 +9,18 @@ Bewusst OHNE NumPy: sounddevice liefert die Audiodaten dann als
 plattformneutrale Bytes/Buffer, was für die paar hundert Samples pro
 Callback völlig ausreichend performant ist und keine zusätzliche (bei
 PyInstaller nicht ganz kleine) Abhängigkeit erzwingt.
+
+WICHTIG: dafür MUSS sounddevice.RawInputStream (nicht InputStream!)
+verwendet werden. sd.InputStream importiert intern immer NumPy (siehe
+sounddevice.py: `_StreamBase.__init__` mit wrap_callback='array'), auch
+wenn der eigene Callback-Code hier gar kein NumPy braucht. Da numpy
+nirgends in bin/requirements.txt steht, ist es auf einem sauberen
+Build/CI-Rechner nicht installiert - sd.InputStream(...) würde dann mit
+ImportError scheitern, was start() unten als generisches "Gerät konnte
+nicht geöffnet werden" abfängt und so die komplette Vorschau lautlos
+lahmlegt (ohne dass ein Fehler sichtbar wird). RawInputStream liefert
+im Callback stattdessen ein reines Python-Bufferobjekt (kompatibel mit
+bytes(indata), siehe _callback unten) und kommt ganz ohne NumPy aus.
 """
 
 import array
@@ -91,7 +103,9 @@ class LevelMeter:
             channels = max(1, min(self._max_channels, int(info.get("max_input_channels", 1) or 1)))
             samplerate = int(info.get("default_samplerate", 44100) or 44100)
 
-            self._stream = sd.InputStream(
+            # RawInputStream statt InputStream - siehe Modul-Docstring oben:
+            # InputStream erzwingt intern NumPy, RawInputStream nicht.
+            self._stream = sd.RawInputStream(
                 device=self.device_index,
                 channels=channels,
                 samplerate=samplerate,

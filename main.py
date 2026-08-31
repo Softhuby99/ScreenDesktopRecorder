@@ -44,8 +44,57 @@ def check_dependencies() -> list[str]:
     except ImportError:
         missing.append("psutil  ->  pip install psutil")
 
-    # sounddevice ist optional (nur Fallback für Geräteerkennung)
+    # sounddevice ist optional - fehlt es, funktioniert die App weiterhin
+    # (Aufnahme läuft komplett über FFmpeg), aber die komplette Live-
+    # Pegelvorschau im Audio-Tab (Mikrofon UND Lautsprecher) bleibt dann
+    # auf "nicht verfügbar", nicht nur die Geräte-Erkennung dort.
     return missing
+
+
+def _set_windows_dpi_awareness():
+    """
+    Aktiviert HiDPI-Unterstützung unter Windows - PER-MONITOR statt nur
+    system-weit, damit die Schrift auch nach dem Verschieben des Fensters
+    auf einen Bildschirm mit ANDEREM Skalierungsfaktor scharf bleibt
+    (bei reiner System-DPI-Awareness würde Windows das Fenster in diesem
+    Fall einfach hochskalieren -> unscharfe/verwaschene Schrift).
+
+    Versucht die modernste verfügbare API zuerst und fällt bei älteren
+    Windows-Versionen stufenweise zurück:
+      1. SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) - Windows 10 1703+
+      2. SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) - Windows 8.1+
+      3. SetProcessDPIAware() - Windows Vista+ (nur System-DPI, letzter Ausweg)
+    Schlagen alle fehl (z. B. weil gar nicht unter Windows ausgeführt),
+    wird das schlicht ignoriert - rein kosmetisch, kein Startabbruch wert.
+    """
+    try:
+        import ctypes
+    except Exception:
+        return
+
+    # 1) Per-Monitor V2 (modernste Variante)
+    try:
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        ):
+            return
+    except Exception:
+        pass
+
+    # 2) Per-Monitor (aeltere, aber immer noch per-Monitor-fähige API)
+    try:
+        PROCESS_PER_MONITOR_DPI_AWARE = 2
+        ctypes.windll.shcore.SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)
+        return
+    except Exception:
+        pass
+
+    # 3) Letzter Ausweg: nur System-DPI (besser als gar nichts)
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -58,11 +107,7 @@ def prepare_platform() -> bool:
     """
     # ---- Windows: scharfe Schrift auf HiDPI-Displays ----
     if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
+        _set_windows_dpi_awareness()
         return True
 
     # ---- Linux: ohne DISPLAY kein GUI-Start ----

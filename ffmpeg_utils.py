@@ -165,12 +165,25 @@ def check_qsv_available(encoder: str, timeout: int = 8) -> bool:
 # ============================================================================
 # 2) VIDEO-EINGABE (plattformabhängig)
 # ============================================================================
-def build_video_input_args(mode_region: bool, region: tuple | None, fps: str) -> list:
+def build_video_input_args(
+    mode_region: bool, region: tuple | None, fps: str,
+    screen_size: tuple[int, int] | None = None,
+) -> list:
     """
     Baut die Video-Eingabeparameter für den jeweiligen Screen-Grabber.
 
     Windows -> gdigrab mit -offset_x / -offset_y
     Linux   -> x11grab mit ':0.0+X,Y'
+
+    screen_size: im Vollbild-Modus unter Linux benötigt x11grab eine
+    explizite Größe. Wird screen_size vom Aufrufer mitgegeben (empfohlen -
+    siehe RecorderThread/BenchmarkThread, die dies bereits vom GUI-Thread
+    ermittelt bekommen), wird DAMIT gearbeitet, statt selbst
+    get_screen_size() aufzurufen - diese Funktion läuft in einem
+    Worker-Thread, und get_screen_size() öffnet dafür ein eigenes
+    Tk-Root, was aus einem Nicht-GUI-Thread nicht sicher ist. Nur wenn
+    kein screen_size übergeben wurde (z. B. Aufruf aus einem Kontext ohne
+    laufende GUI), wird get_screen_size() als Fallback genutzt.
     """
     args: list[str] = []
 
@@ -213,7 +226,7 @@ def build_video_input_args(mode_region: bool, region: tuple | None, fps: str) ->
         ]
     else:
         # x11grab benötigt IMMER eine explizite Größe
-        sw, sh = get_screen_size()
+        sw, sh = screen_size if screen_size else get_screen_size()
         args += [
             "-video_size", f"{sw}x{sh}",
             "-i", display,
@@ -224,11 +237,20 @@ def build_video_input_args(mode_region: bool, region: tuple | None, fps: str) ->
 def _sanitize_region(region: tuple) -> tuple[int, int, int, int]:
     """
     Erzwingt gerade Breiten-/Höhenwerte (Pflicht für yuv420p-Subsampling).
+
+    x/y werden BEWUSST NICHT auf 0 nach unten begrenzt: gdigrabs
+    -offset_x/-offset_y sind relativ zum virtuellen Desktop-Ursprung, der
+    bei einem links von/oberhalb des Hauptbildschirms platzierten Monitor
+    (gängiges Windows-Multi-Monitor-Layout) legitim NEGATIV ist. Ein
+    max(0, x) würde die Aufnahme dann auf den Hauptbildschirm zurückwerfen,
+    statt den vom Nutzer ausgewählten (negativ liegenden) Bereich
+    aufzunehmen - siehe region_selector.py, das den echten (ggf.
+    negativen) Ursprung über winfo_vrootx()/winfo_vrooty() ermittelt.
     """
     x, y, w, h = (int(v) for v in region)
     w -= w % 2
     h -= h % 2
-    return max(0, x), max(0, y), max(2, w), max(2, h)
+    return x, y, max(2, w), max(2, h)
 
 
 # ============================================================================
@@ -280,9 +302,23 @@ def _build_audio_filter_args(gain: float, denoise: bool) -> list:
     return ["-af", ",".join(filters)] if filters else []
 
 
+def _gop_size(fps: str) -> str:
+    """
+    Keyframe-Abstand: IMMER 2 Sekunden, unabhängig von der gewählten
+    Framerate. Ein fest verdrahtetes "-g 60" wäre nur bei 30 FPS wirklich
+    2s (bei 60 FPS wären es 1s, bei 24 FPS ~2.5s) - hier stattdessen an
+    die tatsächliche fps gekoppelt.
+    """
+    try:
+        value = int(round(float(fps) * 2))
+    except (TypeError, ValueError):
+        value = 60
+    return str(max(2, value))
+
+
 def build_output_args(
     encoder: str, preset: str, has_audio: bool, audio_only: bool = False,
-    gain: float = 1.0, denoise: bool = False,
+    gain: float = 1.0, denoise: bool = False, fps: str = "30",
 ) -> list:
     """
     Baut die Encoding-Parameter - identisch auf allen Plattformen.
@@ -296,6 +332,7 @@ def build_output_args(
     has_audio=False ist.
     """
     audio_filter_args = _build_audio_filter_args(gain, denoise) if has_audio else []
+    gop = _gop_size(fps)
 
     if audio_only:
         return [
@@ -319,7 +356,7 @@ def build_output_args(
             "-preset", qsv_preset,
             "-global_quality", QSV_GLOBAL_QUALITY,
             "-pix_fmt", PIXEL_FORMAT,
-            "-g", "60",
+            "-g", gop,
             "-movflags", "+faststart",
         ]
         if encoder == "hevc_qsv":
@@ -333,7 +370,7 @@ def build_output_args(
             # Nulllatenz-Tuning: reduziert RAM-Bedarf & Lookahead-Rechenlast
             "-tune", "zerolatency",
             "-pix_fmt", PIXEL_FORMAT,
-            "-g", "60",                    # Keyframe alle 2 s bei 30 FPS
+            "-g", gop,                     # Keyframe alle 2 s (an fps gekoppelt)
             "-movflags", "+faststart",     # MP4 sofort abspielbar
         ]
         if encoder == "libx265":
@@ -365,6 +402,7 @@ def build_record_command(
     audio_only: bool = False,
     gain: float = 1.0,
     denoise: bool = False,
+    screen_size: tuple[int, int] | None = None,
 ) -> list:
     """
     Setzt das vollständige FFmpeg-Aufnahmekommando zusammen.
@@ -386,12 +424,13 @@ def build_record_command(
     ]
 
     if not audio_only:
-        cmd += build_video_input_args(mode_region, region, fps)
+        cmd += build_video_input_args(mode_region, region, fps, screen_size=screen_size)
     cmd += build_audio_input_args(audio_device)
 
     has_audio = bool(audio_device) or audio_only
     cmd += build_output_args(
         encoder, preset, has_audio, audio_only=audio_only, gain=gain, denoise=denoise,
+        fps=fps,
     )
 
     if has_audio and not audio_only:
@@ -430,7 +469,10 @@ def build_screenshot_command(output_path: str, width: int, height: int) -> list:
     return cmd
 
 
-def build_benchmark_command(output_path: str, duration: int, fps: str = "30") -> list:
+def build_benchmark_command(
+    output_path: str, duration: int, fps: str = "30",
+    screen_size: tuple[int, int] | None = None,
+) -> list:
     """
     Kurze Testaufnahme für den Benchmark.
     Bewusst mit preset 'medium', um die CPU realistisch zu belasten.
@@ -442,7 +484,7 @@ def build_benchmark_command(output_path: str, duration: int, fps: str = "30") ->
         "-y",
     ]
 
-    cmd += build_video_input_args(mode_region=False, region=None, fps=fps)
+    cmd += build_video_input_args(mode_region=False, region=None, fps=fps, screen_size=screen_size)
 
     cmd += [
         "-t", str(duration),
