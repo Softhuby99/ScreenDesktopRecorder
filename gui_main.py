@@ -1200,8 +1200,12 @@ class MainWindow(ctk.CTk):
     def _on_recording_stopped(self, path: str, success: bool):
         # Vor dem Zuruecksetzen sichern - wird gebraucht, um eine evtl.
         # vorzeitig abgeschnittene Aufnahme zu erkennen (siehe
-        # _check_recording_truncated).
+        # _check_recording_truncated) UND um im Fehlerfall die rohe
+        # FFmpeg-Ausgabe in eine Log-Datei schreiben zu koennen, statt
+        # sie nur (gekuerzt) in einer Dialogbox zu zeigen, die leicht
+        # weggeklickt wird, bevor jemand den Text kopieren kann.
         elapsed = self.recorder.get_elapsed() if self.recorder else 0.0
+        stderr_lines = list(self.recorder._stderr_buffer) if self.recorder else []
 
         if self.mini_panel:
             try:
@@ -1229,7 +1233,7 @@ class MainWindow(ctk.CTk):
                 self._set_optimize_file(path)
             threading.Thread(
                 target=self._check_recording_truncated,
-                args=(path, elapsed),
+                args=(path, elapsed, stderr_lines),
                 daemon=True,
             ).start()
             if messagebox.askyesno(
@@ -1241,7 +1245,7 @@ class MainWindow(ctk.CTk):
         else:
             self._set_status("Aufnahme fehlgeschlagen – keine Datei erzeugt.", COLOR_DANGER)
 
-    def _check_recording_truncated(self, path: str, elapsed_seconds: float):
+    def _check_recording_truncated(self, path: str, elapsed_seconds: float, stderr_lines: list):
         """
         Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
         vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
@@ -1264,12 +1268,44 @@ class MainWindow(ctk.CTk):
         if duration is None:
             return
         if duration < elapsed_seconds * 0.7 - 1.0:
-            self.after(0, self._warn_possible_truncation, elapsed_seconds, duration)
+            log_path = self._write_recording_log(
+                path, stderr_lines,
+                f"Aufnahme lief {elapsed_seconds:.0f}s, Datei enthaelt nur {duration:.0f}s.",
+            )
+            self.after(0, self._warn_possible_truncation, elapsed_seconds, duration, log_path)
 
-    def _warn_possible_truncation(self, elapsed_seconds: float, duration: float):
+    def _write_recording_log(self, video_path: str, stderr_lines: list, reason: str) -> str | None:
+        """
+        Schreibt die komplette (bis zu 40 Zeilen) rohe FFmpeg-stderr-
+        Ausgabe in eine Textdatei neben der Videodatei.
+
+        Zweck: eine Dialogbox zeigt nur gekürzten Text und wird leicht
+        weggeklickt, bevor jemand ihn kopieren kann - diese Datei bleibt
+        liegen und lässt sich einfach weitergeben, wenn ein Problem
+        gemeldet wird (genau das hat bislang bei der Windows-Diagnose
+        gefehlt).
+        """
+        try:
+            log_path = os.path.splitext(video_path)[0] + "_aufnahme-log.txt"
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"{reason}\n")
+                f.write(f"Zeitpunkt: {datetime.now().isoformat(timespec='seconds')}\n")
+                f.write("Letzte FFmpeg-Ausgabe (stderr):\n")
+                f.write("-" * 60 + "\n")
+                f.write("\n".join(stderr_lines) if stderr_lines else "(keine Ausgabe erfasst)")
+                f.write("\n")
+            return log_path
+        except Exception:
+            return None
+
+    def _warn_possible_truncation(self, elapsed_seconds: float, duration: float, log_path: str | None):
         self._set_status(
             f"⚠ Datei evtl. unvollständig: {duration:.0f}s statt {elapsed_seconds:.0f}s",
             COLOR_WARNING,
+        )
+        log_hint = (
+            f"\n\nDetails wurden gespeichert in:\n{os.path.basename(log_path)}"
+            if log_path else ""
         )
         messagebox.showwarning(
             "Aufnahme möglicherweise unvollständig",
@@ -1279,13 +1315,21 @@ class MainWindow(ctk.CTk):
             "Aufnahme hin (z. B. ein kurzzeitiger Mikrofon-Puffer-Überlauf), "
             "durch den Video und Audio vorzeitig beendet wurden.\n\n"
             "Falls das öfter passiert: anderes Mikrofon/Audiogerät probieren "
-            "oder testweise ganz ohne Audiospur aufnehmen.",
+            "oder testweise ganz ohne Audiospur aufnehmen."
+            f"{log_hint}",
         )
 
     def _on_recording_error(self, message: str):
         short = message.split("\n")[0][:200]
         self._set_status(short, COLOR_DANGER)
-        messagebox.showerror("Aufnahmefehler", message[:600])
+        log_path = None
+        if self.recorder is not None:
+            log_path = self._write_recording_log(
+                self.recorder.output_path, list(self.recorder._stderr_buffer),
+                "FFmpeg wurde mit einem Fehler beendet.",
+            )
+        log_hint = f"\n\nDetails gespeichert in:\n{os.path.basename(log_path)}" if log_path else ""
+        messagebox.showerror("Aufnahmefehler", message[:600] + log_hint)
 
     def _wait_for_recorder_shutdown(self):
         """
