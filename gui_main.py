@@ -62,7 +62,7 @@ from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpe
 from gui_mini import MiniPanel
 from optimizer import (
     OPTIMIZE_PROFILES, OptimizeThread, get_profile, probe_duration_seconds,
-    suggest_output_path,
+    probe_media_info, suggest_output_path,
 )
 from gui_widgets import LevelMeterBar
 from platform_utils import (
@@ -108,6 +108,7 @@ class MainWindow(ctk.CTk):
         # Mikrofon-/Lautsprecher-Vorschau (Audio-Tab)
         self._meter_devices: list[tuple[str, int]] = []
         self._active_audio_only = False  # siehe _start_recording/_on_recording_started
+        self._recording_had_audio = False  # war eine Tonquelle gewaehlt?
         self._mic_level_meter: LevelMeter | None = None
         self._speaker_level_meter: LevelMeter | None = None
         self._meter_poll_job = None
@@ -1142,6 +1143,10 @@ class MainWindow(ctk.CTk):
         # aufgenommenen Modus anzeigen (nur die MiniPanel-Beschriftung wäre
         # betroffen, nicht die Aufnahme selbst - aber trotzdem irreführend).
         self._active_audio_only = audio_only
+        # Merken, ob ueberhaupt eine Tonquelle im Spiel war - nur dann ist
+        # eine fehlende Audiospur in der fertigen Datei ein Befund und
+        # keine voellig normale Bild-ohne-Ton-Aufnahme.
+        self._recording_had_audio = bool(settings.get("audio_device")) or audio_only
 
         # Vorschau-Geräte freigeben, BEVOR FFmpeg versucht, dieselbe
         # Audioquelle zu öffnen (siehe _pause_meters).
@@ -1295,6 +1300,24 @@ class MainWindow(ctk.CTk):
             log_path, f"Dauer laut Datei: {duration:.1f}s (Aufnahmezeit: {elapsed_seconds:.1f}s)"
         )
 
+        # Streams der fertigen Datei protokollieren. Die Containerdauer
+        # allein verraet NICHT, ob die Tonspur vorhanden ist oder
+        # vorzeitig endet - "Datei volle Laenge, aber Ton nur kurz" sieht
+        # an der Gesamtdauer voellig unauffaellig aus.
+        info = probe_media_info(path)
+        self._append_recording_log(log_path, "Inhalt der Datei laut FFmpeg:\n" + info)
+
+        if "Audio:" not in info:
+            # Es wurde eine Tonquelle gewaehlt, aber es gibt gar keinen
+            # Audiostream - das ist ein eindeutiger Befund, kein Verdacht.
+            if self._recording_had_audio:
+                self._append_recording_log(
+                    log_path,
+                    "BEFUND: Es war eine Tonquelle ausgewaehlt, die Datei enthaelt "
+                    "aber ueberhaupt keinen Audiostream.",
+                )
+                self.after(0, self._warn_no_audio_stream, log_path)
+
         if duration < elapsed_seconds * 0.7 - 1.0:
             self._append_recording_log(
                 log_path,
@@ -1356,6 +1379,22 @@ class MainWindow(ctk.CTk):
                 f.write(f"\n{text}\n")
         except Exception:
             pass
+
+    def _warn_no_audio_stream(self, log_path: str | None):
+        self._set_status("⚠ Aufnahme enthält keine Tonspur", COLOR_WARNING)
+        log_hint = (
+            f"\n\nDetails im Protokoll:\n{os.path.basename(log_path)}"
+            if log_path else ""
+        )
+        messagebox.showwarning(
+            "Keine Tonspur in der Aufnahme",
+            "Es war eine Tonquelle ausgewählt, die fertige Datei enthält "
+            "aber keinen Audiostream.\n\n"
+            "Meist liegt das daran, dass das Aufnahmegerät von einem anderen "
+            "Programm belegt ist oder Windows der App den Mikrofonzugriff "
+            "verweigert (Einstellungen → Datenschutz → Mikrofon)."
+            f"{log_hint}",
+        )
 
     def _warn_unreadable_file(self, log_path: str | None):
         self._set_status("⚠ Datei beschädigt – Dauer nicht auslesbar", COLOR_DANGER)

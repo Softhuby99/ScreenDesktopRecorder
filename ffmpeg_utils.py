@@ -282,6 +282,14 @@ def build_audio_input_args(audio_device: str | None) -> list:
             # etwas hoehere Aufnahmelatenz spielt bei einem Rekorder
             # (anders als bei Livestreaming) keine Rolle.
             "-audio_buffer_size", "500",
+            # Realtime-Puffer von FFmpeg selbst - NICHT zu verwechseln mit
+            # -audio_buffer_size, das den Puffer des Audiogeraets meint.
+            # Standard sind nur ca. 3 MB; laeuft der ueber, verwirft FFmpeg
+            # Audiopakete ("real-time buffer too full" - eine WARNUNG, die
+            # bei -loglevel error unsichtbar blieb). Die Tonspur bekommt
+            # dadurch Luecken oder endet vorzeitig, waehrend das Bild
+            # normal weiterlaeuft - genau das gemeldete "Ton ist nur kurz".
+            "-rtbufsize", "256M",
             "-i", f"audio={audio_device}",
         ]
 
@@ -299,14 +307,19 @@ def build_audio_input_args(audio_device: str | None) -> list:
 # ============================================================================
 def _build_audio_filter_args(gain: float, denoise: bool) -> list:
     """
-    Baut eine optionale '-af'-Filterkette für die Mikrofon-Aufnahme:
+    Baut die '-af'-Filterkette für die Mikrofon-Aufnahme:
+      - aresample: haelt die Tonspur synchron (siehe unten) - IMMER aktiv
       - afftdn:    einfache Rauschunterdrückung (Wunsch: "Performance vom Mikro")
       - volume:    digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
       - alimiter:  Sicherheitsnetz GEGEN digitales Clipping (siehe unten)
-    Wird nur angehängt, wenn tatsächlich etwas zu verändern ist - eine
-    leere Filterkette würde FFmpeg unnötig zusätzliche Arbeit aufbürden.
     """
     filters = []
+    # IMMER zuerst: haelt die Tonspur an der Zeitachse ausgerichtet und
+    # fuellt Aussetzer der Aufnahmequelle mit Stille auf, statt die Spur
+    # dort enden bzw. verrutschen zu lassen. Ohne das endet die Audiospur
+    # bei einem kurzen Geraeteaussetzer schlicht vorzeitig, waehrend das
+    # Bild weiterlaeuft ("Ton ist nur kurz", Datei aber volle Laenge).
+    filters.append("aresample=async=1")
     if denoise:
         filters.append("afftdn")
     boosted = gain is not None and gain > 1.0 + 0.005
@@ -440,7 +453,15 @@ def build_record_command(
     cmd = [
         get_ffmpeg_path(),
         "-hide_banner",
-        "-loglevel", "error",
+        # "warning" statt "error": die fuer Aufnahmeprobleme
+        # entscheidenden Meldungen von dshow/x11grab ("real-time buffer
+        # too full", verworfene Pakete, Geraeteaussetzer) sind WARNUNGEN.
+        # Mit "error" blieben sie unsichtbar - das Diagnose-Log meldete
+        # dann "keine Ausgabe erfasst", obwohl im Hintergrund gerade die
+        # Tonspur zerfiel. Die Menge bleibt gering (keine
+        # Fortschrittszeilen), der Ringpuffer in recorder.py haelt
+        # ohnehin nur die letzten 40 Zeilen.
+        "-loglevel", "warning",
         "-y",
     ]
 

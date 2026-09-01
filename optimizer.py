@@ -114,6 +114,34 @@ def probe_duration_seconds(path: str, timeout: int = 10) -> float | None:
         return None
 
 
+def probe_media_info(path: str, timeout: int = 10) -> str:
+    """
+    Liefert die Roh-Ausgabe von `ffmpeg -i <datei>` (Containerkopf samt
+    aller Streams).
+
+    Gebraucht fuers Aufnahme-Protokoll: die Gesamtdauer des Containers
+    sagt NICHTS darueber aus, ob die Tonspur ueberhaupt vorhanden ist
+    oder vorzeitig endet - genau das war der blinde Fleck bei der
+    Windows-Diagnose ("Datei volle Laenge, aber Ton nur kurz"). Die
+    Stream-Zeilen zeigen Video und Audio dagegen getrennt.
+    """
+    try:
+        proc = subprocess.run(
+            [get_ffmpeg_path(), "-hide_banner", "-i", path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, **get_subprocess_flags(),
+        )
+        text = proc.stderr.decode("utf-8", errors="ignore").strip()
+        # "At least one output file must be specified" ist nur die
+        # erwartete Beschwerde darueber, dass hier bewusst kein
+        # Ausgabeziel angegeben wird - im Protokoll waere sie irrefuehrend.
+        lines = [ln for ln in text.splitlines()
+                 if "At least one output file" not in ln]
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Medieninfo nicht ermittelbar: {exc})"
+
+
 # ============================================================================
 # 3) KOMMANDO-BUILDER
 # ============================================================================
