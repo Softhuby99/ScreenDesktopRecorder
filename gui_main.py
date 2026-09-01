@@ -46,6 +46,17 @@ from config import (
     NO_AUDIO_LABEL, PRESET_OPTIONS, QSV_ENCODERS,
     RADIUS_LG, RADIUS_MD, RADIUS_SM,
 )
+
+try:
+    # Von GitHub Actions bei jedem Build automatisch mit dem echten
+    # Commit-Hash ueberschrieben (siehe build_info.py) - so laesst sich
+    # einer heruntergeladenen .exe zweifelsfrei ansehen, welcher
+    # Commit-Stand tatsaechlich drin steckt, unabhaengig von der von
+    # Hand gepflegten (und leicht mal vergessenen) APP_VERSION.
+    from build_info import BUILD_COMMIT
+except ImportError:
+    BUILD_COMMIT = "dev"
+
 from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpeg_path
 from gui_mini import MiniPanel
 from optimizer import (
@@ -70,7 +81,7 @@ TAB_AUDIO = "🎙️  Audio"
 class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} v{APP_VERSION}")
+        self.title(f"{APP_NAME} v{APP_VERSION} [{BUILD_COMMIT}]")
         self.geometry("560x840")
         # Deutlich kleinere Mindestgroesse als frueher: das Fenster ist per
         # Maus frei in der Groesse veraenderbar (Tk-Standardverhalten, hier

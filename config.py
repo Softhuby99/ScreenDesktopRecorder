@@ -9,7 +9,7 @@ Plattformunabhängig - enthält nur Werte, keine Logik.
 # ANWENDUNGS-METADATEN
 # ----------------------------------------------------------------------------
 APP_NAME = "ScreenRec Pro"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # ----------------------------------------------------------------------------
 # FARBPALETTE (Windows 11 Fluent / Dark Mode - Anthrazit)
