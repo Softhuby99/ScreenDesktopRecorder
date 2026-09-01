@@ -18,14 +18,6 @@ dist/
 bin/ffmpeg.exe
 bin/ffmpeg
 
-# Wird bei JEDEM CI-Build frisch mit dem echten Commit-Hash erzeugt
-# (siehe .github/workflows/build.yml) - bewusst NICHT eingecheckt, damit
-# re-sync-to-repro.sh (git add -A) niemals versehentlich einen von einem
-# lokalen Testbuild stammenden, falschen Hash committet. Fehlt die Datei
-# (z. B. bei python main.py aus dem Quellcode heraus), greift der
-# "dev"-Fallback in gui_main.py.
-build_info.py
-
 # Editor-/OS-Muell
 .vscode/
 .idea/

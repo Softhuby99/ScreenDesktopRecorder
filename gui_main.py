@@ -48,14 +48,15 @@ from config import (
 )
 
 try:
-    # Von GitHub Actions bei jedem Build automatisch mit dem echten
-    # Commit-Hash ueberschrieben (siehe build_info.py) - so laesst sich
-    # einer heruntergeladenen .exe zweifelsfrei ansehen, welcher
-    # Commit-Stand tatsaechlich drin steckt, unabhaengig von der von
-    # Hand gepflegten (und leicht mal vergessenen) APP_VERSION.
-    from build_info import BUILD_COMMIT
+    # Wird von re-sync-to-repro.sh bei jedem Sync mit dem aktuellen
+    # Zeitstempel ueberschrieben und ganz normal mitcommittet (siehe
+    # build_info.py) - so laesst sich einer heruntergeladenen .exe
+    # zweifelsfrei ansehen, welcher Stand tatsaechlich drin steckt,
+    # unabhaengig von der von Hand gepflegten (und leicht mal
+    # vergessenen) APP_VERSION.
+    from build_info import BUILD_STAMP
 except ImportError:
-    BUILD_COMMIT = "dev"
+    BUILD_STAMP = "dev"
 
 from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpeg_path
 from gui_mini import MiniPanel
@@ -81,7 +82,7 @@ TAB_AUDIO = "🎙️  Audio"
 class MainWindow(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_NAME} v{APP_VERSION} [{BUILD_COMMIT}]")
+        self.title(f"{APP_NAME} v{APP_VERSION} [{BUILD_STAMP}]")
         self.geometry("560x840")
         # Deutlich kleinere Mindestgroesse als frueher: das Fenster ist per
         # Maus frei in der Groesse veraenderbar (Tk-Standardverhalten, hier
