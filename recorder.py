@@ -62,6 +62,12 @@ class RecorderThread(threading.Thread):
         # Ringpuffer der letzten stderr-Zeilen (für Fehlermeldungen)
         self._stderr_buffer: list[str] = []
 
+        # Das tatsächlich ausgeführte FFmpeg-Kommando - wird für das
+        # Diagnose-Log gebraucht (siehe gui_main._write_recording_log).
+        # Ohne das Kommando laesst sich an einem Fehlerbild kaum
+        # nachvollziehen, mit welchen Parametern aufgenommen wurde.
+        self.command: list[str] = []
+
     # ==================================================================
     # ÖFFENTLICHE API (wird vom GUI-Thread aufgerufen)
     # ==================================================================
@@ -154,6 +160,7 @@ class RecorderThread(threading.Thread):
                 # erzeugen (siehe platform_utils.get_screen_size-Docstring).
                 screen_size=self.settings.get("screen_size"),
             )
+            self.command = list(cmd)
 
             self._process = subprocess.Popen(
                 cmd,

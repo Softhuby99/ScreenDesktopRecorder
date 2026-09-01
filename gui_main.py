@@ -1207,6 +1207,7 @@ class MainWindow(ctk.CTk):
         # weggeklickt wird, bevor jemand den Text kopieren kann.
         elapsed = self.recorder.get_elapsed() if self.recorder else 0.0
         stderr_lines = list(self.recorder._stderr_buffer) if self.recorder else []
+        command = list(self.recorder.command) if self.recorder else []
 
         if self.mini_panel:
             try:
@@ -1219,6 +1220,14 @@ class MainWindow(ctk.CTk):
         self.lift()
         self.recorder = None
         self._resume_meters()
+
+        # IMMER ein Log schreiben - unabhaengig von Erfolg oder Fehler.
+        # Frueher entstand nur im Verdachtsfall eines, wodurch ausgerechnet
+        # die schlimmsten Faelle (Datei unbrauchbar oder gar nicht erst
+        # angelegt) voellig spurlos blieben. Ein kleines Textfile pro
+        # Aufnahme ist der Preis dafuer, dass ein Problem immer
+        # nachvollziehbar ist.
+        log_path = self._write_recording_log(path, stderr_lines, command, elapsed, success)
 
         if success:
             size_mb = os.path.getsize(path) / (1024 * 1024)
@@ -1234,7 +1243,7 @@ class MainWindow(ctk.CTk):
                 self._set_optimize_file(path)
             threading.Thread(
                 target=self._check_recording_truncated,
-                args=(path, elapsed, stderr_lines),
+                args=(path, elapsed, log_path),
                 daemon=True,
             ).start()
             if messagebox.askyesno(
@@ -1244,9 +1253,13 @@ class MainWindow(ctk.CTk):
             ):
                 open_file_manager(path)
         else:
-            self._set_status("Aufnahme fehlgeschlagen – keine Datei erzeugt.", COLOR_DANGER)
+            hint = f"  (Details: {os.path.basename(log_path)})" if log_path else ""
+            self._set_status(
+                f"Aufnahme fehlgeschlagen – keine verwertbare Datei.{hint}",
+                COLOR_DANGER,
+            )
 
-    def _check_recording_truncated(self, path: str, elapsed_seconds: float, stderr_lines: list):
+    def _check_recording_truncated(self, path: str, elapsed_seconds: float, log_path: str | None):
         """
         Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
         vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
@@ -1269,48 +1282,80 @@ class MainWindow(ctk.CTk):
 
         if duration is None:
             # Die Dauer liess sich nicht einmal auslesen - genau der Fall
-            # "Datei laesst sich gar nicht abspielen". Frueher wurde hier
-            # still abgebrochen, sodass ausgerechnet im schlimmsten
-            # Fehlerfall KEIN Diagnose-Log entstand. Das ist selbst ein
-            # Befund und wird deshalb protokolliert und gemeldet.
-            log_path = self._write_recording_log(
-                path, stderr_lines,
-                f"Aufnahme lief {elapsed_seconds:.0f}s, aber die Dauer der Datei "
-                "ist nicht auslesbar - Datei vermutlich beschaedigt/unvollstaendig.",
+            # "Datei laesst sich gar nicht abspielen".
+            self._append_recording_log(
+                log_path,
+                f"BEFUND: Aufnahme lief {elapsed_seconds:.0f}s, aber die Dauer der "
+                "Datei ist nicht auslesbar - Datei vermutlich beschaedigt/unvollstaendig.",
             )
             self.after(0, self._warn_unreadable_file, log_path)
             return
 
+        self._append_recording_log(
+            log_path, f"Dauer laut Datei: {duration:.1f}s (Aufnahmezeit: {elapsed_seconds:.1f}s)"
+        )
+
         if duration < elapsed_seconds * 0.7 - 1.0:
-            log_path = self._write_recording_log(
-                path, stderr_lines,
-                f"Aufnahme lief {elapsed_seconds:.0f}s, Datei enthaelt nur {duration:.0f}s.",
+            self._append_recording_log(
+                log_path,
+                f"BEFUND: Datei deutlich kuerzer als die Aufnahmezeit "
+                f"({duration:.0f}s statt {elapsed_seconds:.0f}s) - vorzeitig abgeschnitten.",
             )
             self.after(0, self._warn_possible_truncation, elapsed_seconds, duration, log_path)
 
-    def _write_recording_log(self, video_path: str, stderr_lines: list, reason: str) -> str | None:
+    def _write_recording_log(self, video_path: str, stderr_lines: list, command: list,
+                             elapsed_seconds: float, success: bool) -> str | None:
         """
-        Schreibt die komplette (bis zu 40 Zeilen) rohe FFmpeg-stderr-
-        Ausgabe in eine Textdatei neben der Videodatei.
+        Schreibt nach JEDER Aufnahme ein Protokoll neben die Datei -
+        auch bei Erfolg.
 
         Zweck: eine Dialogbox zeigt nur gekürzten Text und wird leicht
-        weggeklickt, bevor jemand ihn kopieren kann - diese Datei bleibt
-        liegen und lässt sich einfach weitergeben, wenn ein Problem
-        gemeldet wird (genau das hat bislang bei der Windows-Diagnose
-        gefehlt).
+        weggeklickt, bevor jemand ihn kopieren kann; und die frühere
+        Variante, nur im Verdachtsfall zu protokollieren, ließ
+        ausgerechnet die schlimmsten Fälle (Datei unbrauchbar oder gar
+        nicht erst angelegt) spurlos verschwinden.
+
+        Neben der FFmpeg-Ausgabe wird bewusst auch das vollständige
+        FFmpeg-Kommando festgehalten: ohne die tatsächlich verwendeten
+        Parameter lässt sich ein Fehlerbild kaum nachvollziehen.
         """
         try:
             log_path = os.path.splitext(video_path)[0] + "_aufnahme-log.txt"
+            try:
+                size_info = f"{os.path.getsize(video_path)} Bytes"
+            except OSError:
+                size_info = "Datei nicht vorhanden"
+
             with open(log_path, "w", encoding="utf-8") as f:
-                f.write(f"{reason}\n")
-                f.write(f"Zeitpunkt: {datetime.now().isoformat(timespec='seconds')}\n")
-                f.write("Letzte FFmpeg-Ausgabe (stderr):\n")
+                f.write(f"ScreenRec Pro v{APP_VERSION} [{BUILD_STAMP}]\n")
+                f.write(f"Zeitpunkt:      {datetime.now().isoformat(timespec='seconds')}\n")
+                f.write(f"Ergebnis:       {'OK' if success else 'FEHLGESCHLAGEN'}\n")
+                f.write(f"Aufnahmedauer:  {elapsed_seconds:.1f}s\n")
+                f.write(f"Datei:          {os.path.basename(video_path)} ({size_info})\n")
+                f.write("\nFFmpeg-Kommando:\n")
+                f.write("-" * 60 + "\n")
+                f.write(" ".join(command) if command else "(nicht erfasst)")
+                f.write("\n\nFFmpeg-Ausgabe (stderr, letzte Zeilen):\n")
                 f.write("-" * 60 + "\n")
                 f.write("\n".join(stderr_lines) if stderr_lines else "(keine Ausgabe erfasst)")
                 f.write("\n")
             return log_path
         except Exception:
             return None
+
+    def _append_recording_log(self, log_path: str | None, text: str):
+        """
+        Haengt einen nachtraeglich ermittelten Befund an ein bereits
+        geschriebenes Protokoll an (die Dauerpruefung laeuft erst nach
+        dem Schreiben des Logs im Hintergrund).
+        """
+        if not log_path:
+            return
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{text}\n")
+        except Exception:
+            pass
 
     def _warn_unreadable_file(self, log_path: str | None):
         self._set_status("⚠ Datei beschädigt – Dauer nicht auslesbar", COLOR_DANGER)
@@ -1349,16 +1394,19 @@ class MainWindow(ctk.CTk):
         )
 
     def _on_recording_error(self, message: str):
+        # Das Protokoll schreibt _on_recording_stopped, das unmittelbar
+        # nach diesem Callback ohnehin immer laeuft (auch im Fehlerfall) -
+        # hier also bewusst KEIN eigenes Log, sonst wuerde es gleich
+        # darauf ueberschrieben.
         short = message.split("\n")[0][:200]
         self._set_status(short, COLOR_DANGER)
-        log_path = None
-        if self.recorder is not None:
-            log_path = self._write_recording_log(
-                self.recorder.output_path, list(self.recorder._stderr_buffer),
-                "FFmpeg wurde mit einem Fehler beendet.",
-            )
-        log_hint = f"\n\nDetails gespeichert in:\n{os.path.basename(log_path)}" if log_path else ""
-        messagebox.showerror("Aufnahmefehler", message[:600] + log_hint)
+        messagebox.showerror(
+            "Aufnahmefehler",
+            message[:600]
+            + "\n\nEin Protokoll mit dem vollständigen FFmpeg-Aufruf und "
+              "seiner Ausgabe liegt neben der Aufnahmedatei "
+              "(…_aufnahme-log.txt).",
+        )
 
     def _wait_for_recorder_shutdown(self):
         """

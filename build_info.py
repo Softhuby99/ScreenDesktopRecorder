@@ -5,4 +5,4 @@ Der Stempel erscheint im Fenstertitel und zeigt, welcher Stand
 in einer gebauten .exe/Binary tatsaechlich steckt.
 """
 
-BUILD_STAMP = "2026-09-01 23:44 CEST"
+BUILD_STAMP = "2026-09-02 00:20 CEST"
