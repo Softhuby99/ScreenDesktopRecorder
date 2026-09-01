@@ -1265,9 +1265,22 @@ class MainWindow(ctk.CTk):
         try:
             duration = probe_duration_seconds(path)
         except Exception:
-            return
+            duration = None
+
         if duration is None:
+            # Die Dauer liess sich nicht einmal auslesen - genau der Fall
+            # "Datei laesst sich gar nicht abspielen". Frueher wurde hier
+            # still abgebrochen, sodass ausgerechnet im schlimmsten
+            # Fehlerfall KEIN Diagnose-Log entstand. Das ist selbst ein
+            # Befund und wird deshalb protokolliert und gemeldet.
+            log_path = self._write_recording_log(
+                path, stderr_lines,
+                f"Aufnahme lief {elapsed_seconds:.0f}s, aber die Dauer der Datei "
+                "ist nicht auslesbar - Datei vermutlich beschaedigt/unvollstaendig.",
+            )
+            self.after(0, self._warn_unreadable_file, log_path)
             return
+
         if duration < elapsed_seconds * 0.7 - 1.0:
             log_path = self._write_recording_log(
                 path, stderr_lines,
@@ -1298,6 +1311,21 @@ class MainWindow(ctk.CTk):
             return log_path
         except Exception:
             return None
+
+    def _warn_unreadable_file(self, log_path: str | None):
+        self._set_status("⚠ Datei beschädigt – Dauer nicht auslesbar", COLOR_DANGER)
+        log_hint = (
+            f"\n\nDetails wurden gespeichert in:\n{os.path.basename(log_path)}"
+            if log_path else ""
+        )
+        messagebox.showwarning(
+            "Aufnahme vermutlich beschädigt",
+            "Die Datei wurde zwar angelegt, lässt sich aber nicht auslesen – "
+            "sie ist vermutlich unvollständig und nicht abspielbar.\n\n"
+            "Das passiert, wenn FFmpeg die Aufnahme nicht sauber abschließen "
+            "konnte (die Datei bekommt dann keinen gültigen Abschluss-Block)."
+            f"{log_hint}",
+        )
 
     def _warn_possible_truncation(self, elapsed_seconds: float, duration: float, log_path: str | None):
         self._set_status(
