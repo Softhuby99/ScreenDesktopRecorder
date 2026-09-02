@@ -212,24 +212,41 @@ def check_ddagrab_available(timeout: int = 10) -> bool:
     return ok
 
 
-def _should_use_ddagrab(mode_region: bool, region: tuple | None) -> bool:
+def _should_use_ddagrab(
+    mode_region: bool, region: tuple | None,
+    screen_size: tuple[int, int] | None = None,
+) -> bool:
     """
     Entscheidet, ob ddagrab statt gdigrab benutzt werden kann.
 
-    Zwei Ausschlussgründe:
+    Ausschlussgründe - in allen Fällen wird auf gdigrab zurückgefallen,
+    das den gesamten virtuellen Desktop abdeckt:
       * Die Desktop Duplication API steht nicht zur Verfügung (zu altes
-        Windows, kein D3D11, FFmpeg ohne ddagrab) - dann bleibt gdigrab.
+        Windows, kein D3D11, FFmpeg ohne ddagrab).
       * Der gewählte Bereich liegt links/oberhalb des Hauptmonitors
         (negative Koordinaten im virtuellen Desktop). ddagrab rechnet
         relativ zum jeweiligen Monitor und kann das nicht abbilden;
         gdigrab dagegen schon (siehe _sanitize_region).
+      * Der Bereich ragt über den Hauptmonitor hinaus, liegt also
+        (teilweise) auf einem zweiten Monitor rechts/unterhalb. ddagrab
+        nimmt hier nur output_idx=0 auf und würde entweder abbrechen
+        oder den falschen Ausschnitt liefern. Diese Prüfung ist wichtig,
+        weil die einmalige Verfügbarkeitsprüfung nur den Vollbildfall
+        testet - ein erst zur Laufzeit scheiternder Bereichsaufruf hätte
+        keine Rückfallebene mehr.
     """
     if not IS_WINDOWS:
         return False
+
     if mode_region and region:
-        x, y = int(region[0]), int(region[1])
+        x, y, w, h = _sanitize_region(region)
         if x < 0 or y < 0:
             return False
+        if screen_size:
+            sw, sh = screen_size
+            if x + w > sw or y + h > sh:
+                return False
+
     return check_ddagrab_available()
 
 
@@ -563,7 +580,7 @@ def build_record_command(
 
     use_ddagrab = False
     if not audio_only:
-        use_ddagrab = _should_use_ddagrab(mode_region, region)
+        use_ddagrab = _should_use_ddagrab(mode_region, region, screen_size)
         cmd += build_video_input_args(
             mode_region, region, fps, screen_size=screen_size,
             use_ddagrab=use_ddagrab,
@@ -643,7 +660,7 @@ def build_benchmark_command(
     # benutzt wird - sonst beurteilt der Benchmark gdigrab, waehrend die
     # Aufnahme ddagrab verwendet (oder umgekehrt), und sein Urteil
     # ("PC gut geeignet") sagt nichts ueber die echte Aufnahme aus.
-    use_ddagrab = _should_use_ddagrab(False, None)
+    use_ddagrab = _should_use_ddagrab(False, None, screen_size)
     cmd += build_video_input_args(
         mode_region=False, region=None, fps=fps, screen_size=screen_size,
         use_ddagrab=use_ddagrab,
