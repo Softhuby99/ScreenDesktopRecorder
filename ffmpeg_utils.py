@@ -165,14 +165,94 @@ def check_qsv_available(encoder: str, timeout: int = 8) -> bool:
 # ============================================================================
 # 2) VIDEO-EINGABE (plattformabhängig)
 # ============================================================================
+_DDAGRAB_CACHE: dict[str, bool] = {}
+
+
+def check_ddagrab_available(timeout: int = 10) -> bool:
+    """
+    Prüft, ob die Desktop Duplication API (ddagrab) nutzbar ist.
+
+    Hintergrund: gdigrab nutzt die alte GDI-Schnittstelle (BitBlt) und
+    ist auf modernen Windows-Systemen mit zusammengesetztem Desktop
+    dramatisch langsam - eine Messung auf echter Hardware ergab bei
+    1920x1080 nur 3-22 statt der angeforderten 30 Bilder/s, was zu
+    winzigen, ruckeligen Aufnahmen führt. ddagrab (Windows 8+, D3D11,
+    FFmpeg >= 6) holt die Bilder direkt von der GPU und erreichte auf
+    derselben Hardware 29,9 fps.
+
+    Ergebnis wird zwischengespeichert - der Test kostet ~1 s und das
+    Ergebnis ändert sich zur Laufzeit nicht.
+    """
+    if not IS_WINDOWS:
+        return False
+    if "ok" in _DDAGRAB_CACHE:
+        return _DDAGRAB_CACHE["ok"]
+
+    import subprocess
+    from platform_utils import get_subprocess_flags
+
+    ok = False
+    try:
+        cmd = [
+            get_ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "ddagrab=output_idx=0:framerate=5",
+            "-frames:v", "3",
+            "-vf", "hwdownload,format=bgra",
+            "-f", "null", "-",
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            **get_subprocess_flags(),
+        )
+        ok = result.returncode == 0
+    except Exception:
+        ok = False
+
+    _DDAGRAB_CACHE["ok"] = ok
+    return ok
+
+
+def _should_use_ddagrab(mode_region: bool, region: tuple | None) -> bool:
+    """
+    Entscheidet, ob ddagrab statt gdigrab benutzt werden kann.
+
+    Zwei Ausschlussgründe:
+      * Die Desktop Duplication API steht nicht zur Verfügung (zu altes
+        Windows, kein D3D11, FFmpeg ohne ddagrab) - dann bleibt gdigrab.
+      * Der gewählte Bereich liegt links/oberhalb des Hauptmonitors
+        (negative Koordinaten im virtuellen Desktop). ddagrab rechnet
+        relativ zum jeweiligen Monitor und kann das nicht abbilden;
+        gdigrab dagegen schon (siehe _sanitize_region).
+    """
+    if not IS_WINDOWS:
+        return False
+    if mode_region and region:
+        x, y = int(region[0]), int(region[1])
+        if x < 0 or y < 0:
+            return False
+    return check_ddagrab_available()
+
+
+def build_video_filter_args(use_ddagrab: bool) -> list:
+    """
+    Filter, die NUR bei ddagrab nötig sind: dessen Bilder liegen im
+    Grafikspeicher (D3D11) und müssen erst in den Hauptspeicher geholt
+    werden, bevor libx264 & Co. sie kodieren können.
+    """
+    if not use_ddagrab:
+        return []
+    return ["-vf", "hwdownload,format=bgra"]
+
+
 def build_video_input_args(
     mode_region: bool, region: tuple | None, fps: str,
     screen_size: tuple[int, int] | None = None,
+    use_ddagrab: bool = False,
 ) -> list:
     """
     Baut die Video-Eingabeparameter für den jeweiligen Screen-Grabber.
 
-    Windows -> gdigrab mit -offset_x / -offset_y
+    Windows -> ddagrab (bevorzugt, GPU) oder gdigrab (Rückfallebene)
     Linux   -> x11grab mit ':0.0+X,Y'
 
     screen_size: im Vollbild-Modus unter Linux benötigt x11grab eine
@@ -187,7 +267,23 @@ def build_video_input_args(
     """
     args: list[str] = []
 
-    # ---------------- WINDOWS: gdigrab -----------------------------------
+    # ---------------- WINDOWS: ddagrab (bevorzugt) -----------------------
+    if IS_WINDOWS and use_ddagrab:
+        opts = [
+            "output_idx=0",
+            f"framerate={fps}",
+            "draw_mouse=1",
+        ]
+        if mode_region and region:
+            x, y, w, h = _sanitize_region(region)
+            # Negative Offsets kann ddagrab nicht abbilden (seine Offsets
+            # sind relativ zum jeweiligen Monitor, nicht zum virtuellen
+            # Desktop) - solche Bereiche filtert build_record_command
+            # vorher heraus und nimmt dann gdigrab.
+            opts += [f"video_size={w}x{h}", f"offset_x={x}", f"offset_y={y}"]
+        return ["-f", "lavfi", "-i", "ddagrab=" + ":".join(opts)]
+
+    # ---------------- WINDOWS: gdigrab (Rückfallebene) -------------------
     if IS_WINDOWS:
         args += [
             "-f", "gdigrab",
@@ -465,11 +561,19 @@ def build_record_command(
         "-y",
     ]
 
+    use_ddagrab = False
     if not audio_only:
-        cmd += build_video_input_args(mode_region, region, fps, screen_size=screen_size)
+        use_ddagrab = _should_use_ddagrab(mode_region, region)
+        cmd += build_video_input_args(
+            mode_region, region, fps, screen_size=screen_size,
+            use_ddagrab=use_ddagrab,
+        )
     cmd += build_audio_input_args(audio_device)
 
     has_audio = bool(audio_device) or audio_only
+    # Muss VOR den Encoder-Optionen stehen: holt die GPU-Bilder von
+    # ddagrab in den Hauptspeicher (bei gdigrab/x11grab leer).
+    cmd += build_video_filter_args(use_ddagrab)
     cmd += build_output_args(
         encoder, preset, has_audio, audio_only=audio_only, gain=gain, denoise=denoise,
         fps=fps,
@@ -535,10 +639,21 @@ def build_benchmark_command(
         "-y",
     ]
 
-    cmd += build_video_input_args(mode_region=False, region=None, fps=fps, screen_size=screen_size)
+    # Muss dasselbe Aufnahmeverfahren messen, das spaeter auch wirklich
+    # benutzt wird - sonst beurteilt der Benchmark gdigrab, waehrend die
+    # Aufnahme ddagrab verwendet (oder umgekehrt), und sein Urteil
+    # ("PC gut geeignet") sagt nichts ueber die echte Aufnahme aus.
+    use_ddagrab = _should_use_ddagrab(False, None)
+    cmd += build_video_input_args(
+        mode_region=False, region=None, fps=fps, screen_size=screen_size,
+        use_ddagrab=use_ddagrab,
+    )
 
     cmd += [
         "-t", str(duration),
+    ]
+    cmd += build_video_filter_args(use_ddagrab)
+    cmd += [
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", CRF_X264,

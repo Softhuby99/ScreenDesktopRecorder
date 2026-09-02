@@ -1355,6 +1355,7 @@ class MainWindow(ctk.CTk):
                 f.write(f"Ergebnis:       {'OK' if success else 'FEHLGESCHLAGEN'}\n")
                 f.write(f"Aufnahmedauer:  {elapsed_seconds:.1f}s\n")
                 f.write(f"Datei:          {os.path.basename(video_path)} ({size_info})\n")
+                f.write(f"Aufnahmeverfahren: {self._capture_method_from(command)}\n")
                 f.write("\nFFmpeg-Kommando:\n")
                 f.write("-" * 60 + "\n")
                 f.write(" ".join(command) if command else "(nicht erfasst)")
@@ -1365,6 +1366,26 @@ class MainWindow(ctk.CTk):
             return log_path
         except Exception:
             return None
+
+    @staticmethod
+    def _capture_method_from(command: list) -> str:
+        """
+        Liest aus dem tatsächlich ausgeführten Kommando ab, welches
+        Bildschirm-Aufnahmeverfahren zum Zug kam. Wichtig fürs Protokoll:
+        gdigrab und ddagrab unterscheiden sich auf derselben Hardware um
+        ein Vielfaches in der erreichten Bildrate, und ddagrab fällt bei
+        fehlender Unterstützung stillschweigend auf gdigrab zurück.
+        """
+        joined = " ".join(command)
+        if "ddagrab" in joined:
+            return "ddagrab (Desktop Duplication API, GPU)"
+        if "gdigrab" in joined:
+            return "gdigrab (GDI - langsamer Rückfallweg)"
+        if "x11grab" in joined:
+            return "x11grab (Linux)"
+        if not command:
+            return "(nicht erfasst)"
+        return "(nur Ton)"
 
     def _append_recording_log(self, log_path: str | None, text: str):
         """
