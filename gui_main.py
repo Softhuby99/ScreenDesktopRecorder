@@ -21,6 +21,7 @@ eingereiht wird.
 """
 
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -1213,6 +1214,13 @@ class MainWindow(ctk.CTk):
         elapsed = self.recorder.get_elapsed() if self.recorder else 0.0
         stderr_lines = list(self.recorder._stderr_buffer) if self.recorder else []
         command = list(self.recorder.command) if self.recorder else []
+        # Angeforderte Bildrate merken - nur im Vergleich dazu laesst sich
+        # sagen, ob die Aufnahme wirklich mitgekommen ist (siehe
+        # _check_recording_fps).
+        try:
+            requested_fps = float(self.recorder.settings.get("fps", 0)) if self.recorder else 0.0
+        except (TypeError, ValueError):
+            requested_fps = 0.0
 
         if self.mini_panel:
             try:
@@ -1248,7 +1256,7 @@ class MainWindow(ctk.CTk):
                 self._set_optimize_file(path)
             threading.Thread(
                 target=self._check_recording_truncated,
-                args=(path, elapsed, log_path),
+                args=(path, elapsed, log_path, requested_fps),
                 daemon=True,
             ).start()
             if messagebox.askyesno(
@@ -1264,7 +1272,8 @@ class MainWindow(ctk.CTk):
                 COLOR_DANGER,
             )
 
-    def _check_recording_truncated(self, path: str, elapsed_seconds: float, log_path: str | None):
+    def _check_recording_truncated(self, path: str, elapsed_seconds: float,
+                                   log_path: str | None, requested_fps: float = 0.0):
         """
         Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
         vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
@@ -1306,6 +1315,8 @@ class MainWindow(ctk.CTk):
         # an der Gesamtdauer voellig unauffaellig aus.
         info = probe_media_info(path)
         self._append_recording_log(log_path, "Inhalt der Datei laut FFmpeg:\n" + info)
+
+        self._check_recording_fps(info, requested_fps, log_path)
 
         if "Audio:" not in info:
             # Es wurde eine Tonquelle gewaehlt, aber es gibt gar keinen
@@ -1366,6 +1377,66 @@ class MainWindow(ctk.CTk):
             return log_path
         except Exception:
             return None
+
+    @staticmethod
+    def parse_achieved_fps(media_info: str) -> float | None:
+        """
+        Liest die TATSÄCHLICH erreichte Bildrate aus der Stream-Zeile.
+
+        FFmpeg gibt dort zwei Werte aus: "9.17 fps" ist der echte
+        Durchschnitt (Bilder geteilt durch Dauer), "60 tbr" nur die im
+        Container eingetragene Sollrate. Genau diese Verwechslung
+        verschleiert das Problem: eine Datei kann "60 tbr" tragen und
+        trotzdem nur 9 Bilder pro Sekunde enthalten.
+        """
+        for line in media_info.splitlines():
+            if "Video:" not in line:
+                continue
+            match = re.search(r"(\d+(?:\.\d+)?)\s+fps", line)
+            if match:
+                try:
+                    return float(match.group(1))
+                except ValueError:
+                    return None
+        return None
+
+    def _check_recording_fps(self, media_info: str, requested_fps: float,
+                             log_path: str | None):
+        """
+        Vergleicht erreichte mit angeforderter Bildrate.
+
+        Wird BEWUSST nur protokolliert und NICHT als Warnung angezeigt.
+
+        Eine niedrige Durchschnittsbildrate hat zwei völlig verschiedene
+        Ursachen, die sich im Nachhinein an der Datei nicht
+        unterscheiden lassen:
+          1) Der Bildschirm hat sich kaum verändert. Unter Windows
+             liefern die Aufnahmeverfahren dann von sich aus weniger
+             Bilder - die Datei ist klein und trotzdem völlig korrekt,
+             die Wiedergabe stimmt (die Zeitstempel passen, die Dauer
+             stimmt). Das ist erwünscht und spart Platz.
+          2) Der Encoder kam nicht hinterher (zu langsames Preset, zu
+             hohe Bildrate) - dann fehlen tatsächlich Bilder.
+        Eine Warnung würde nach jeder ruhigen Aufnahme fälschlich
+        anschlagen; deshalb steht der Wert nur im Protokoll, wo er beim
+        Nachforschen hilft, ohne im Normalbetrieb zu stören.
+        """
+        if requested_fps <= 0:
+            return
+        achieved = self.parse_achieved_fps(media_info)
+        if achieved is None:
+            return
+
+        ratio = achieved / requested_fps
+        note = ""
+        if ratio < 0.7:
+            note = ("  (deutlich unter dem Sollwert - entweder ruhiger "
+                    "Bildschirминhalt oder der Encoder kam nicht mit)")
+        self._append_recording_log(
+            log_path,
+            f"Bildrate: {achieved:.1f} von {requested_fps:.0f} fps erreicht "
+            f"({ratio * 100:.0f} %){note}",
+        )
 
     @staticmethod
     def _capture_method_from(command: list) -> str:

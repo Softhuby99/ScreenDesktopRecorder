@@ -646,35 +646,42 @@ def build_benchmark_command(
     screen_size: tuple[int, int] | None = None,
 ) -> list:
     """
-    Kurze Testaufnahme für den Benchmark.
-    Bewusst mit preset 'medium', um die CPU realistisch zu belasten.
+    Testlauf für den Benchmark: kodiert eine feste Anzahl bewegter
+    Testbilder in der Bildschirmauflösung, so schnell die Maschine kann.
+
+    Bewusst KEINE Bildschirmaufnahme mehr, sondern eine synthetische
+    Bewegtquelle (testsrc2):
+      * Sie liefert garantiert bei jedem Bild neuen Inhalt. Eine
+        Bildschirmaufnahme misst dagegen mit, wie viel sich zufällig
+        gerade auf dem Desktop bewegt - bei ruhigem Bildschirm sah
+        selbst eine überforderte Maschine gut aus.
+      * Ohne Echtzeit-Quelle läuft die Kodierung so schnell wie möglich
+        ab. Aus "Bilder geteilt durch benötigte Zeit" ergibt sich direkt
+        der Durchsatz des Encoders - genau die Zahl, die entscheidet, ob
+        30 oder 60 fps im Betrieb überhaupt erreichbar sind.
+    Die Ausgabe geht ins Nichts (-f null); es entsteht keine Datei.
     """
-    cmd = [
+    width, height = screen_size if screen_size else (1920, 1080)
+    # Gerade Kantenlaengen sind Pflicht fuer yuv420p
+    width -= width % 2
+    height -= height % 2
+
+    try:
+        frames = max(1, int(round(float(fps) * duration)))
+    except (TypeError, ValueError):
+        frames = 30 * duration
+
+    return [
         get_ffmpeg_path(),
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-    ]
-
-    # Muss dasselbe Aufnahmeverfahren messen, das spaeter auch wirklich
-    # benutzt wird - sonst beurteilt der Benchmark gdigrab, waehrend die
-    # Aufnahme ddagrab verwendet (oder umgekehrt), und sein Urteil
-    # ("PC gut geeignet") sagt nichts ueber die echte Aufnahme aus.
-    use_ddagrab = _should_use_ddagrab(False, None, screen_size)
-    cmd += build_video_input_args(
-        mode_region=False, region=None, fps=fps, screen_size=screen_size,
-        use_ddagrab=use_ddagrab,
-    )
-
-    cmd += [
-        "-t", str(duration),
-    ]
-    cmd += build_video_filter_args(use_ddagrab)
-    cmd += [
+        "-f", "lavfi",
+        "-i", f"testsrc2=size={width}x{height}:rate={fps}",
+        "-frames:v", str(frames),
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", CRF_X264,
         "-pix_fmt", PIXEL_FORMAT,
-        output_path,
+        "-f", "null", "-",
     ]
-    return cmd

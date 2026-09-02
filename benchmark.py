@@ -75,7 +75,13 @@ class BenchmarkThread(threading.Thread):
         )
 
         try:
-            self._emit(self.on_progress, "Starte Testaufnahme ...")
+            self._emit(self.on_progress, "Starte Leistungstest ...")
+
+            # Zielbildrate des Tests - der gemessene Durchsatz wird spaeter
+            # gegen genau diesen Wert verrechnet.
+            bench_fps = 30.0
+            bench_frames = int(bench_fps * BENCHMARK_DURATION)
+            started_at = time.time()
 
             cmd = build_benchmark_command(
                 temp_file, BENCHMARK_DURATION, fps="30", screen_size=self._screen_size,
@@ -109,39 +115,58 @@ class BenchmarkThread(threading.Thread):
             samples: list[float] = []
             psutil.cpu_percent(interval=None)  # Referenzpunkt setzen
 
-            for i in range(BENCHMARK_DURATION):
+            # Laeuft, bis FFmpeg die feste Bilderzahl abgearbeitet hat -
+            # NICHT mehr feste BENCHMARK_DURATION Sekunden lang. Genau
+            # diese Zeit ist ja das Messergebnis: eine schnelle Maschine
+            # ist frueher fertig, eine langsame braucht laenger.
+            while self._process.poll() is None:
                 if self._cancelled.is_set():
                     raise InterruptedError("Benchmark abgebrochen.")
-
                 value = psutil.cpu_percent(interval=BENCHMARK_SAMPLE_INTERVAL)
                 samples.append(value)
+                elapsed = time.time() - started_at
                 self._emit(
                     self.on_progress,
-                    f"Messung läuft ... {i + 1}/{BENCHMARK_DURATION}s "
-                    f"(CPU: {value:.0f} %)",
+                    f"Messung läuft ... {elapsed:.0f}s (CPU: {value:.0f} %)",
                 )
+                if elapsed > 120:      # Notbremse gegen Haenger
+                    break
 
             self._emit(self.on_progress, "Werte werden ausgewertet ...")
+            duration_s = max(0.001, time.time() - started_at)
             self._terminate_process()
 
             if not samples:
-                raise RuntimeError("Keine CPU-Messwerte erfasst.")
+                samples = [psutil.cpu_percent(interval=None)]
 
             avg_cpu = sum(samples) / len(samples)
             peak_cpu = max(samples)
 
-            # Entscheidungs-Matrix anwenden
+            # ----------------------------------------------------------
+            # Kernzahl: wie viele Bilder pro Sekunde schafft der Encoder
+            # tatsaechlich? Frueher entschied allein die CPU-Auslastung -
+            # das ist untauglich, weil x264 nur wenige Kerne saettigt:
+            # eine Maschine, die real nur ~9 fps kodiert, blieb dabei
+            # unter 60 % Gesamtauslastung und bekam deshalb "60 FPS,
+            # preset medium" empfohlen. Ergebnis waren ruckelige
+            # Aufnahmen mit einem Bruchteil der Bilder.
+            # ----------------------------------------------------------
+            throughput = bench_frames / duration_s
+            ratio = throughput / bench_fps
+
             tier = next(t for t in BENCHMARK_TIERS if avg_cpu < t["max_cpu"])
+            tier, downgrade_note = self._limit_tier_by_throughput(tier, ratio, throughput)
 
             result = {
                 "avg_cpu": round(avg_cpu, 1),
                 "peak_cpu": round(peak_cpu, 1),
                 "samples": samples,
+                "throughput_fps": round(throughput, 1),
                 "fps": tier["fps"],
                 "encoder": tier["encoder"],
                 "preset": tier["preset"],
                 "title": tier["title"],
-                "message": tier["message"],
+                "message": tier["message"] + downgrade_note,
                 "color": tier["color"],
             }
 
@@ -156,6 +181,47 @@ class BenchmarkThread(threading.Thread):
         finally:
             self._terminate_process()
             self._cleanup_temp(temp_file)
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _limit_tier_by_throughput(tier: dict, ratio: float, throughput: float):
+        """
+        Deckelt die Empfehlung anhand des gemessenen Encoder-Durchsatzes.
+
+        'ratio' ist der Durchsatz im Verhältnis zur Testbildrate (30):
+        1,0 heißt "schafft 30 fps gerade eben in Echtzeit".
+
+        Warum überhaupt gedeckelt wird: Ein Preset, das die Maschine nicht
+        in Echtzeit kodieren kann, führt nicht zu einer schlechteren, aber
+        vollständigen Aufnahme - es fehlen schlicht Bilder. 60 fps zu
+        empfehlen, wenn nicht einmal 30 erreicht werden, macht das Problem
+        nur größer.
+
+        :return: (moeglicherweise ersetzter Tier, Zusatztext fuer die Meldung)
+        """
+        tier = dict(tier)   # Original in BENCHMARK_TIERS nicht veraendern
+
+        if ratio >= 2.0:
+            return tier, ""                      # schafft locker 60 fps
+
+        if ratio >= 1.2:
+            # Reicht fuer 30 fps mit Reserve, aber nicht fuer 60.
+            if tier["fps"] == "60":
+                tier["fps"] = "30"
+                return tier, (f"\n(30 statt 60 FPS: gemessener Durchsatz "
+                              f"{throughput:.0f} Bilder/s.)")
+            return tier, ""
+
+        if ratio >= 0.7:
+            tier["fps"] = "30"
+            tier["preset"] = "veryfast"
+            return tier, (f"\n(Schnelleres Preset gewählt: gemessener Durchsatz "
+                          f"{throughput:.0f} Bilder/s.)")
+
+        tier["fps"] = "30"
+        tier["preset"] = "ultrafast"
+        return tier, (f"\n(Schnellstes Preset gewählt: der Encoder schafft hier "
+                      f"nur {throughput:.0f} Bilder/s.)")
 
     # ------------------------------------------------------------------
     def _terminate_process(self):
