@@ -383,18 +383,17 @@ def build_audio_input_args(audio_device: str | None) -> list:
         return [
             "-f", "dshow",
             "-thread_queue_size", "1024",
-            # 80 ms war zu knapp bemessen: sobald Bildschirmaufnahme +
-            # Encoding kurzzeitig mehr CPU-Zeit brauchen (normal, gerade
-            # bei langsameren Encoder-Presets), lief der dshow-Puffer
-            # dabei ueber - hoerbar als starke Verzerrung/Knacken in der
-            # Audiospur, und im schlimmsten Fall bricht der Audio-Stream
-            # dabei komplett ab (siehe -shortest weiter unten, das dann
-            # die GESAMTE Aufnahme auf wenige KB zusammenstutzt). 500 ms
-            # ist FFmpegs eigener Standardwert fuer dshow und deutlich
-            # toleranter gegenueber kurzen CPU-Spitzen - die dadurch
-            # etwas hoehere Aufnahmelatenz spielt bei einem Rekorder
-            # (anders als bei Livestreaming) keine Rolle.
-            "-audio_buffer_size", "500",
+            # BEWUSST KEIN -audio_buffer_size mehr.
+            #
+            # Frueher stand hier 80 ms, dann von mir auf 500 ms erhoeht -
+            # in der Annahme, ein ueberlaufender Puffer verursache die
+            # gemeldete Tonverzerrung. Die Messung auf echter Hardware
+            # hat das widerlegt: 500, 100, 50 ms und "gar nicht gesetzt"
+            # verhielten sich praktisch identisch (11,2 / 11,0 / 11,6 /
+            # 11,9 fps im Mittel). Der Wert war also nie die Ursache.
+            # Ohne ausdrueckliche Angabe gilt der Geraetestandard - ein
+            # Sonderwert weniger, der spaeter jemanden in die Irre
+            # fuehren kann.
             # Realtime-Puffer von FFmpeg selbst - NICHT zu verwechseln mit
             # -audio_buffer_size, das den Puffer des Audiogeraets meint.
             # Standard sind nur ca. 3 MB; laeuft der ueber, verwirft FFmpeg
@@ -578,6 +577,21 @@ def build_record_command(
         "-y",
     ]
 
+    # REIHENFOLGE DER EINGABEN IST ENTSCHEIDEND - Audio MUSS zuerst stehen.
+    #
+    # Auf echter Windows-Hardware dreimal nachgemessen (je 15 s, sieben
+    # Varianten, sonst voellig identische Parameter):
+    #
+    #   Bild zuerst, Ton danach   ->  7,7 - 12,7 fps von 30
+    #   Ton zuerst, Bild danach   -> 29,8 - 30,0 fps von 30
+    #
+    # Weder Puffergroesse (500/100/50/keine) noch eine eigene
+    # Warteschlange am Videoeingang aenderten etwas - nur die
+    # Reihenfolge. Steht die ddagrab-Quelle als erste Eingabe, wird sie
+    # offenbar im Gleichschritt mit dem langsam eintreffenden dshow-Ton
+    # abgefragt und liefert entsprechend weniger Bilder.
+    cmd += build_audio_input_args(audio_device)
+
     use_ddagrab = False
     if not audio_only:
         use_ddagrab = _should_use_ddagrab(mode_region, region, screen_size)
@@ -585,7 +599,6 @@ def build_record_command(
             mode_region, region, fps, screen_size=screen_size,
             use_ddagrab=use_ddagrab,
         )
-    cmd += build_audio_input_args(audio_device)
 
     has_audio = bool(audio_device) or audio_only
     # Muss VOR den Encoder-Optionen stehen: holt die GPU-Bilder von
