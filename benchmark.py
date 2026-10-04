@@ -5,29 +5,48 @@ Führt den automatischen Performance-Test in einem eigenen Thread aus,
 damit die GUI zu keinem Zeitpunkt einfriert.
 
 Ablauf:
-  1. Unsichtbare 5-Sekunden-Testaufnahme ins TEMP-Verzeichnis
-  2. Parallel: CPU-Messung im Sekundentakt via psutil
-  3. Aufnahme stoppen, Testdatei löschen
-  4. Mittelwert berechnen -> Tier aus BENCHMARK_TIERS ableiten
-  5. Ergebnis via Callback an den GUI-Thread zurückmelden
+  1. CPU-Messung (5 s): Testbilder werden im Echtzeit-Takt mit der
+     anspruchsvollsten Einstellung (60 FPS, Preset 'medium') kodiert,
+     dabei misst psutil im Sekundentakt die CPU-Auslastung.
+     -> Entscheidungs-Matrix (< 60 % / 60-85 % / > 85 %) wie gehabt.
+  2. Durchsatz-Kontrolle (je ~3 s): die von der Matrix gewählte
+     Einstellung wird "so schnell wie möglich" kodiert. Schafft der
+     Encoder die Bildrate NICHT mit Reserve, wird schrittweise ein
+     schnelleres Preset bzw. eine niedrigere Bildrate gewählt.
+  3. Ergebnis via Callback an den GUI-Thread zurückmelden.
+
+Warum Schritt 2 nötig ist: eine niedrige CPU-Auslastung heißt nicht
+automatisch, dass der Encoder schnell genug ist. Kommt er bei der
+Aufnahme nicht hinterher, wird das Video nicht schlechter, sondern es
+fehlen Bilder - es ruckelt. Genau das ist früher passiert, weil der Test
+mit anderen Encoder-Einstellungen gemessen hat als die Aufnahme selbst.
+Inzwischen nutzen beide exakt dieselben Parameter (siehe
+ffmpeg_utils.build_video_encoder_args).
+
+Es entsteht keine Testdatei - FFmpeg kodiert ins Nichts (-f null).
 """
 
-import os
 import subprocess
-import tempfile
 import threading
 import time
-import uuid
 
 import psutil
 
 from config import (
     BENCHMARK_DURATION,
+    BENCHMARK_HEADROOM,
+    BENCHMARK_MAX_PRESET_60FPS,
+    BENCHMARK_PRESET_LADDER,
     BENCHMARK_SAMPLE_INTERVAL,
+    BENCHMARK_THROUGHPUT_SECONDS,
     BENCHMARK_TIERS,
 )
 from ffmpeg_utils import build_benchmark_command
 from platform_utils import get_subprocess_flags
+
+# Die ersten Sekundenbruchteile eines Laufs (Prozessstart, Lookahead des
+# Encoders fuellt sich) werden bei der Durchsatzberechnung ignoriert.
+_WARMUP_SECONDS = 1.0
 
 
 class BenchmarkThread(threading.Thread):
@@ -70,106 +89,49 @@ class BenchmarkThread(threading.Thread):
 
     # ------------------------------------------------------------------
     def run(self):
-        temp_file = os.path.join(
-            tempfile.gettempdir(), f"screenrec_bench_{uuid.uuid4().hex}.mp4"
-        )
-
         try:
             self._emit(self.on_progress, "Starte Leistungstest ...")
 
-            # Zielbildrate des Tests - der gemessene Durchsatz wird spaeter
-            # gegen genau diesen Wert verrechnet.
-            bench_fps = 30.0
-            bench_frames = int(bench_fps * BENCHMARK_DURATION)
-            started_at = time.time()
-
-            cmd = build_benchmark_command(
-                temp_file, BENCHMARK_DURATION, fps="30", screen_size=self._screen_size,
+            # ---- 1) CPU-Last bei der anspruchsvollsten Einstellung ------
+            top = BENCHMARK_TIERS[0]
+            stage = self._run_stage(
+                build_benchmark_command(
+                    preset=top["preset"], fps=top["fps"],
+                    screen_size=self._screen_size, realtime=True,
+                ),
+                seconds=BENCHMARK_DURATION, sample_cpu=True,
+                label="CPU-Messung",
             )
-            self._process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                **get_subprocess_flags(),
-            )
-
-            # Kurz warten und prüfen, ob FFmpeg überhaupt starten konnte
-            time.sleep(0.6)
-            if self._process.poll() is not None:
-                err = b""
-                try:
-                    err = self._process.stderr.read() or b""
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    err.decode("utf-8", errors="ignore").strip()
-                    or "FFmpeg konnte die Testaufnahme nicht starten."
-                )
-
-            # ----------------------------------------------------------
-            # CPU-Messung im Sekundentakt
-            # psutil.cpu_percent(interval=X) blockiert X Sekunden und
-            # liefert den Durchschnitt dieses Zeitfensters.
-            # ----------------------------------------------------------
-            samples: list[float] = []
-            psutil.cpu_percent(interval=None)  # Referenzpunkt setzen
-
-            # Laeuft, bis FFmpeg die feste Bilderzahl abgearbeitet hat -
-            # NICHT mehr feste BENCHMARK_DURATION Sekunden lang. Genau
-            # diese Zeit ist ja das Messergebnis: eine schnelle Maschine
-            # ist frueher fertig, eine langsame braucht laenger.
-            while self._process.poll() is None:
-                if self._cancelled.is_set():
-                    raise InterruptedError("Benchmark abgebrochen.")
-                value = psutil.cpu_percent(interval=BENCHMARK_SAMPLE_INTERVAL)
-                samples.append(value)
-                elapsed = time.time() - started_at
-                self._emit(
-                    self.on_progress,
-                    f"Messung läuft ... {elapsed:.0f}s (CPU: {value:.0f} %)",
-                )
-                if elapsed > 120:      # Notbremse gegen Haenger
-                    break
-
-            self._emit(self.on_progress, "Werte werden ausgewertet ...")
-            duration_s = max(0.001, time.time() - started_at)
-            self._terminate_process()
-
-            if not samples:
-                samples = [psutil.cpu_percent(interval=None)]
-
+            samples = stage["cpu"] or [psutil.cpu_percent(interval=None)]
             avg_cpu = sum(samples) / len(samples)
             peak_cpu = max(samples)
 
-            # ----------------------------------------------------------
-            # Kernzahl: wie viele Bilder pro Sekunde schafft der Encoder
-            # tatsaechlich? Frueher entschied allein die CPU-Auslastung -
-            # das ist untauglich, weil x264 nur wenige Kerne saettigt:
-            # eine Maschine, die real nur ~9 fps kodiert, blieb dabei
-            # unter 60 % Gesamtauslastung und bekam deshalb "60 FPS,
-            # preset medium" empfohlen. Ergebnis waren ruckelige
-            # Aufnahmen mit einem Bruchteil der Bilder.
-            # ----------------------------------------------------------
-            throughput = bench_frames / duration_s
-            ratio = throughput / bench_fps
-
             tier = next(t for t in BENCHMARK_TIERS if avg_cpu < t["max_cpu"])
-            tier, downgrade_note = self._limit_tier_by_throughput(tier, ratio, throughput)
 
-            result = {
-                "avg_cpu": round(avg_cpu, 1),
-                "peak_cpu": round(peak_cpu, 1),
-                "samples": samples,
-                "throughput_fps": round(throughput, 1),
-                "fps": tier["fps"],
-                "encoder": tier["encoder"],
-                "preset": tier["preset"],
-                "title": tier["title"],
-                "message": tier["message"] + downgrade_note,
-                "color": tier["color"],
-            }
+            # ---- 2) Durchsatz der gewählten Einstellung prüfen ----------
+            measured: dict[str, float] = {}
 
+            def throughput_of(preset: str) -> float:
+                if preset not in measured:
+                    result = self._run_stage(
+                        build_benchmark_command(
+                            preset=preset, fps="30",
+                            screen_size=self._screen_size, realtime=False,
+                        ),
+                        seconds=BENCHMARK_THROUGHPUT_SECONDS, sample_cpu=False,
+                        label=f"Encoder-Test (Preset {preset})",
+                    )
+                    measured[preset] = result["fps"]
+                return measured[preset]
+
+            fps, preset, throughput, reachable = self.choose_config(tier, throughput_of)
+
+            self._emit(self.on_progress, "Werte werden ausgewertet ...")
+            result = self.build_result(
+                fps, preset, throughput, reachable,
+                avg_cpu=avg_cpu, peak_cpu=peak_cpu, samples=samples,
+                measured=measured,
+            )
             self._emit(self.on_finish, result)
 
         except InterruptedError:
@@ -180,48 +142,200 @@ class BenchmarkThread(threading.Thread):
             self._emit(self.on_error, f"Benchmark fehlgeschlagen: {exc}")
         finally:
             self._terminate_process()
-            self._cleanup_temp(temp_file)
 
     # ------------------------------------------------------------------
+    # ENTSCHEIDUNG (rein rechnerisch - ohne FFmpeg testbar)
+    # ------------------------------------------------------------------
     @staticmethod
-    def _limit_tier_by_throughput(tier: dict, ratio: float, throughput: float):
+    def choose_config(tier: dict, throughput_of) -> tuple[str, str, float, bool]:
         """
-        Deckelt die Empfehlung anhand des gemessenen Encoder-Durchsatzes.
+        Sucht ausgehend vom Matrix-Ergebnis (tier) die beste Einstellung,
+        die der Encoder MIT RESERVE schafft.
 
-        'ratio' ist der Durchsatz im Verhältnis zur Testbildrate (30):
-        1,0 heißt "schafft 30 fps gerade eben in Echtzeit".
+        Reserve (BENCHMARK_HEADROOM): der Test misst nur das Kodieren.
+        Bei der echten Aufnahme kommen Bildschirm abgreifen, Ton und
+        alles, was sonst auf dem Rechner läuft, noch dazu.
 
-        Warum überhaupt gedeckelt wird: Ein Preset, das die Maschine nicht
-        in Echtzeit kodieren kann, führt nicht zu einer schlechteren, aber
-        vollständigen Aufnahme - es fehlen schlicht Bilder. 60 fps zu
-        empfehlen, wenn nicht einmal 30 erreicht werden, macht das Problem
-        nur größer.
+        Reihenfolge: erst die Bildrate des Tiers mit immer schnelleren
+        Presets, dann die nächstniedrigere Bildrate. 60 FPS werden nur
+        mit höchstens BENCHMARK_MAX_PRESET_60FPS empfohlen - lieber 30
+        FPS in guter Qualität als 60 FPS mit sehr grobem Bild.
 
-        :return: (moeglicherweise ersetzter Tier, Zusatztext fuer die Meldung)
+        :param throughput_of: Funktion preset -> gemessene Bilder/s
+        :return: (fps, preset, gemessener Durchsatz, ausreichend?)
         """
-        tier = dict(tier)   # Original in BENCHMARK_TIERS nicht veraendern
+        ladder = list(BENCHMARK_PRESET_LADDER)
+        start = ladder.index(tier["preset"]) if tier["preset"] in ladder else 0
+        max_60 = ladder.index(BENCHMARK_MAX_PRESET_60FPS)
 
-        if ratio >= 2.0:
-            return tier, ""                      # schafft locker 60 fps
+        tier_fps = float(tier["fps"])
+        fps_candidates = [f for f in ("60", "30", "24") if float(f) <= tier_fps]
 
-        if ratio >= 1.2:
-            # Reicht fuer 30 fps mit Reserve, aber nicht fuer 60.
-            if tier["fps"] == "60":
-                tier["fps"] = "30"
-                return tier, (f"\n(30 statt 60 FPS: gemessener Durchsatz "
-                              f"{throughput:.0f} Bilder/s.)")
-            return tier, ""
+        for fps in fps_candidates:
+            need = float(fps) * BENCHMARK_HEADROOM
+            presets = ladder[start:]
+            if fps == "60":
+                presets = [p for p in presets if ladder.index(p) <= max_60]
+            for preset in presets:
+                value = throughput_of(preset)
+                if value >= need:
+                    return fps, preset, value, True
 
-        if ratio >= 0.7:
-            tier["fps"] = "30"
-            tier["preset"] = "veryfast"
-            return tier, (f"\n(Schnelleres Preset gewählt: gemessener Durchsatz "
-                          f"{throughput:.0f} Bilder/s.)")
+        # Nicht einmal das schnellste Preset reicht bei der niedrigsten
+        # Bildrate - trotzdem die schonendste Einstellung empfehlen.
+        fastest = ladder[-1]
+        return fps_candidates[-1], fastest, throughput_of(fastest), False
 
-        tier["fps"] = "30"
-        tier["preset"] = "ultrafast"
-        return tier, (f"\n(Schnellstes Preset gewählt: der Encoder schafft hier "
-                      f"nur {throughput:.0f} Bilder/s.)")
+    @staticmethod
+    def build_result(fps: str, preset: str, throughput: float, reachable: bool,
+                     avg_cpu: float, peak_cpu: float, samples: list,
+                     measured: dict) -> dict:
+        """Setzt Meldung/Farbe passend zur tatsächlich gewählten Einstellung."""
+        if fps == "60":
+            tier = BENCHMARK_TIERS[0]
+        elif fps == "30" and preset in ("medium", "fast", "faster"):
+            tier = BENCHMARK_TIERS[1]
+        else:
+            tier = BENCHMARK_TIERS[2]
+
+        need = float(fps) * BENCHMARK_HEADROOM
+        message = tier["message"]
+        if fps == "24":
+            message += "\n24 FPS gewählt - 30 FPS schafft dieses Gerät nicht ruckelfrei."
+        if reachable:
+            message += (f"\n(Encoder schafft {throughput:.0f} Bilder/s mit Preset "
+                        f"'{preset}', benötigt werden {need:.0f}.)")
+        else:
+            message += (f"\n\nAchtung: Selbst mit dem schnellsten Preset schafft "
+                        f"der Encoder nur {throughput:.0f} Bilder/s in voller "
+                        f"Bildschirmauflösung. Für flüssige Aufnahmen besser "
+                        f"\"Bereich wählen\" und einen kleineren Ausschnitt aufnehmen.")
+
+        return {
+            "avg_cpu": round(avg_cpu, 1),
+            "peak_cpu": round(peak_cpu, 1),
+            "samples": samples,
+            "throughput_fps": round(throughput, 1),
+            "measured": {k: round(v, 1) for k, v in measured.items()},
+            "fps": fps,
+            "encoder": tier["encoder"],
+            "preset": preset,
+            "title": tier["title"] if reachable else "Schwache Hardware",
+            "message": message,
+            "color": tier["color"],
+        }
+
+    # ------------------------------------------------------------------
+    # EIN MESSLAUF
+    # ------------------------------------------------------------------
+    def _run_stage(self, cmd: list, seconds: float, sample_cpu: bool, label: str) -> dict:
+        """
+        Startet FFmpeg, lässt es 'seconds' Sekunden laufen und liefert
+        {"fps": kodierte Bilder pro Sekunde, "cpu": [CPU-Werte]}.
+
+        Die Bilder pro Sekunde werden aus dem Anstieg des Bildzählers
+        NACH der Anlaufphase berechnet - Prozessstart und das Füllen des
+        Encoder-Lookaheads würden das Ergebnis sonst nach unten verzerren.
+        """
+        if self._cancelled.is_set():
+            raise InterruptedError("Benchmark abgebrochen.")
+
+        self._process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **get_subprocess_flags(),
+        )
+        process = self._process
+
+        points: list[tuple[float, int]] = []   # (Zeitpunkt, kodierte Bilder)
+        stderr_lines: list[str] = []
+
+        def read_progress():
+            frame = 0
+            try:
+                for raw in iter(process.stdout.readline, b""):
+                    line = raw.decode("utf-8", errors="ignore").strip()
+                    if line.startswith("frame="):
+                        try:
+                            frame = int(line.split("=", 1)[1])
+                        except ValueError:
+                            pass
+                    elif line.startswith("progress="):
+                        points.append((time.time(), frame))
+            except Exception:
+                pass
+
+        def read_stderr():
+            try:
+                for raw in iter(process.stderr.readline, b""):
+                    text = raw.decode("utf-8", errors="ignore").rstrip()
+                    if text:
+                        stderr_lines.append(text)
+                        del stderr_lines[:-20]
+            except Exception:
+                pass
+
+        readers = [
+            threading.Thread(target=read_progress, daemon=True),
+            threading.Thread(target=read_stderr, daemon=True),
+        ]
+        for t in readers:
+            t.start()
+
+        started = time.time()
+        cpu_samples: list[float] = []
+        if sample_cpu:
+            psutil.cpu_percent(interval=None)  # Referenzpunkt setzen
+
+        while time.time() - started < seconds:
+            if self._cancelled.is_set():
+                raise InterruptedError("Benchmark abgebrochen.")
+            if process.poll() is not None:
+                break
+            if sample_cpu:
+                # blockiert BENCHMARK_SAMPLE_INTERVAL Sekunden und liefert
+                # den Durchschnitt dieses Zeitfensters
+                value = psutil.cpu_percent(interval=BENCHMARK_SAMPLE_INTERVAL)
+                cpu_samples.append(value)
+                self._emit(
+                    self.on_progress,
+                    f"{label} ... {time.time() - started:.0f}s (CPU: {value:.0f} %)",
+                )
+            else:
+                self._emit(self.on_progress, f"{label} ...")
+                time.sleep(0.25)
+
+        exited_early = process.poll() is not None
+        self._terminate_process()
+        for t in readers:
+            t.join(timeout=2)
+
+        if exited_early and process.returncode not in (0, None) and len(points) < 2:
+            raise RuntimeError(
+                "\n".join(stderr_lines[-5:])
+                or "FFmpeg konnte den Leistungstest nicht ausführen."
+            )
+
+        return {"fps": self.throughput_from_points(points, started), "cpu": cpu_samples}
+
+    @staticmethod
+    def throughput_from_points(points: list[tuple[float, int]], started: float) -> float:
+        """
+        Bilder pro Sekunde aus den Fortschrittsmeldungen - als Anstieg
+        zwischen erster Meldung nach der Anlaufphase und letzter Meldung.
+        Gibt es dafür zu wenige Meldungen (sehr langsames Gerät), wird
+        ersatzweise über die gesamte Laufzeit gemittelt.
+        """
+        if not points:
+            return 0.0
+        steady = [p for p in points if p[0] - started >= _WARMUP_SECONDS]
+        if len(steady) >= 2 and steady[-1][0] > steady[0][0]:
+            (t0, f0), (t1, f1) = steady[0], steady[-1]
+            return max(0.0, (f1 - f0) / (t1 - t0))
+        t_last, f_last = points[-1]
+        return max(0.0, f_last / max(0.001, t_last - started))
 
     # ------------------------------------------------------------------
     def _terminate_process(self):
@@ -240,13 +354,3 @@ class BenchmarkThread(threading.Thread):
                 self._process.wait(timeout=2)
             except Exception:
                 pass
-
-    def _cleanup_temp(self, path: str):
-        """Löscht die temporäre Testdatei (mit kurzen Retries)."""
-        for _ in range(5):
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-                return
-            except Exception:
-                time.sleep(0.3)

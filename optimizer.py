@@ -142,6 +142,44 @@ def probe_media_info(path: str, timeout: int = 10) -> str:
         return f"(Medieninfo nicht ermittelbar: {exc})"
 
 
+_MAX_VOLUME_RE = re.compile(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB")
+
+
+def probe_max_volume_db(path: str, max_seconds: int = 600, timeout: int = 180) -> float | None:
+    """
+    Lautester Moment der ersten Tonspur in dB (0 dB = Vollaussteuerung).
+
+    Gebraucht, um eine STUMME Tonspur zu erkennen: Sperrt Windows den
+    Mikrofonzugriff für Desktop-Apps (Datenschutz-Einstellungen), liefert
+    das Gerät trotzdem Ton - nur eben reine Stille. Die Datei hat dann
+    eine ganz normale Audiospur, die Prüfung "gibt es überhaupt eine
+    Tonspur?" schlägt also nicht an, und man hört trotzdem nichts.
+    Digitale Stille misst volumedetect als -91 dB oder -inf.
+
+    Untersucht höchstens die ersten max_seconds Sekunden, damit die
+    Prüfung auch nach sehr langen Aufnahmen schnell fertig ist.
+
+    :return: dB-Wert (ggf. float('-inf')) oder None, wenn nicht ermittelbar
+    """
+    try:
+        proc = subprocess.run(
+            [get_ffmpeg_path(), "-hide_banner", "-nostats",
+             "-t", str(max_seconds), "-i", path,
+             "-map", "0:a:0", "-vn", "-sn", "-dn",
+             "-af", "volumedetect", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, **get_subprocess_flags(),
+        )
+        text = proc.stderr.decode("utf-8", errors="ignore")
+        match = _MAX_VOLUME_RE.search(text)
+        if not match:
+            return None
+        value = match.group(1)
+        return float("-inf") if "inf" in value else float(value)
+    except Exception:
+        return None
+
+
 # ============================================================================
 # 3) KOMMANDO-BUILDER
 # ============================================================================

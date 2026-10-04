@@ -62,6 +62,7 @@ installiert alle Abhängigkeiten sowie PyInstaller und baut
 | `platform_utils.py` | Betriebssystem-Abstraktion (Windows/Linux/macOS) |
 | `config.py` | Zentrale Konstanten (Farben, Encoding-Presets, Benchmark-Matrix) |
 | `optimizer.py` | Nachträgliche Verkleinerung fertiger Videodateien (Thread) |
+| `settings_store.py` | Merkt sich Tonquelle, Speicherort, FPS, Encoder und Preset zwischen zwei Starts (`%APPDATA%\ScreenRecPro\settings.json` bzw. `~/.config/ScreenRecPro/settings.json`) |
 
 ## Video- und Audio-Tab
 
@@ -78,6 +79,30 @@ Das Hauptfenster ist in zwei Tabs aufgeteilt:
 
 Welcher der beiden Tabs gerade offen ist, bestimmt, was der
 "Start"-Button unten aufnimmt.
+
+Die gewählte Tonquelle (und Speicherort, FPS, Encoder, Preset) bleibt
+über einen Neustart hinweg erhalten. Die Pegelanzeige zeigt genau das
+Gerät, das auch aufgenommen wird. Ist die Tonspur einer fertigen
+Aufnahme komplett stumm (z. B. weil Windows den Mikrofonzugriff für
+Desktop-Apps sperrt), warnt die App mit den möglichen Ursachen.
+
+**Ton vom PC selbst (Systemton) unter Windows:** FFmpeg kann unter
+Windows nur Aufnahmegeräte (DirectShow) öffnen. Der Ton, der aus den
+Lautsprechern kommt, ist nur aufnehmbar, wenn ein Gerät wie "Stereomix"
+vorhanden und aktiviert ist - viele neuere Notebooks haben das nicht.
+
+## Leistungstest ("System testen & optimieren")
+
+1. **CPU-Messung (5 s):** Testbilder werden im Echtzeit-Takt mit der
+   anspruchsvollsten Einstellung (60 FPS, Preset `medium`) kodiert, die
+   CPU-Auslastung wird im Sekundentakt gemessen -> Entscheidungsmatrix
+   (< 60 % / 60-85 % / > 85 %).
+2. **Durchsatz-Kontrolle (je ca. 3 s):** Die gewählte Einstellung wird so
+   schnell wie möglich kodiert - mit exakt denselben Encoder-Parametern
+   wie die echte Aufnahme. Schafft der Encoder die Bildrate nicht mit
+   40 % Reserve, wird schrittweise auf ein schnelleres Preset bzw. eine
+   niedrigere Bildrate (bis 24 FPS) ausgewichen. So wird nichts
+   empfohlen, bei dem die Aufnahme später Bilder verliert (Ruckeln).
 
 ## Video nachträglich verkleinern
 

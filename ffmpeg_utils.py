@@ -462,6 +462,59 @@ def _gop_size(fps: str) -> str:
     return str(max(2, value))
 
 
+def build_video_encoder_args(encoder: str, preset: str, fps: str = "30") -> list:
+    """
+    Reine Video-Encoder-Parameter (Codec, Preset, Qualität, Pixelformat,
+    Keyframe-Abstand) - OHNE Container-Optionen wie -movflags.
+
+    Bewusst als eigene Funktion: Aufnahme (build_output_args) UND
+    Leistungstest (build_benchmark_command) nutzen exakt diese Parameter.
+    Früher hat der Test mit anderen Einstellungen kodiert als die echte
+    Aufnahme (ohne -tune zerolatency) und dadurch Presets/Bildraten
+    empfohlen, die bei der Aufnahme selbst nicht mehr hinterherkamen ->
+    fehlende Bilder, ruckelige Videos.
+    """
+    gop = _gop_size(fps)
+
+    if encoder in QSV_ENCODERS:
+        # Intel Quick Sync kennt kein '-crf' und unterstützt die Presets
+        # 'ultrafast'/'superfast' von libx264/265 nicht - auf 'veryfast'
+        # abbilden statt einen FFmpeg-Fehler zu riskieren.
+        qsv_preset = "veryfast" if preset in ("ultrafast", "superfast") else preset
+        args = [
+            "-c:v", encoder,
+            "-preset", qsv_preset,
+            "-global_quality", QSV_GLOBAL_QUALITY,
+            "-pix_fmt", PIXEL_FORMAT,
+            "-g", gop,
+        ]
+        if encoder == "hevc_qsv":
+            args += ["-tag:v", "hvc1"]
+        return args
+
+    crf = CRF_X265 if encoder == "libx265" else CRF_X264
+    # BEWUSST KEIN "-tune zerolatency" mehr.
+    #
+    # zerolatency ist fuer Livestreams gedacht (jedes Bild sofort raus).
+    # Es schaltet x264/x265 u. a. auf "sliced threads" um - laut x264
+    # selbst "Low-latency but lower-efficiency threading" - und deaktiviert
+    # Lookahead und B-Frames. Fuer eine Aufnahme in eine DATEI bringt die
+    # geringere Latenz nichts, kostet auf Mehrkern-CPUs aber spuerbar
+    # Durchsatz (und Dateigroesse). Ohne das Tuning verteilt der Encoder
+    # ganze Bilder auf die Kerne ("frame threads") und schafft dadurch
+    # mehr Bilder pro Sekunde - genau das, was gegen Ruckeln hilft.
+    args = [
+        "-c:v", encoder,
+        "-preset", preset,
+        "-crf", crf,
+        "-pix_fmt", PIXEL_FORMAT,
+        "-g", gop,                     # Keyframe alle 2 s (an fps gekoppelt)
+    ]
+    if encoder == "libx265":
+        args += ["-tag:v", "hvc1"]
+    return args
+
+
 def build_output_args(
     encoder: str, preset: str, has_audio: bool, audio_only: bool = False,
     gain: float = 1.0, denoise: bool = False, fps: str = "30",
@@ -478,7 +531,6 @@ def build_output_args(
     has_audio=False ist.
     """
     audio_filter_args = _build_audio_filter_args(gain, denoise) if has_audio else []
-    gop = _gop_size(fps)
 
     if audio_only:
         return [
@@ -490,37 +542,8 @@ def build_output_args(
             *audio_filter_args,
         ]
 
-    is_qsv = encoder in QSV_ENCODERS
-
-    if is_qsv:
-        # Intel Quick Sync kennt weder '-crf' noch '-tune zerolatency' und
-        # unterstützt die Presets 'ultrafast'/'superfast' von libx264/265
-        # nicht - auf 'veryfast' abbilden statt einen FFmpeg-Fehler zu riskieren.
-        qsv_preset = "veryfast" if preset in ("ultrafast", "superfast") else preset
-        args = [
-            "-c:v", encoder,
-            "-preset", qsv_preset,
-            "-global_quality", QSV_GLOBAL_QUALITY,
-            "-pix_fmt", PIXEL_FORMAT,
-            "-g", gop,
-            "-movflags", "+faststart",
-        ]
-        if encoder == "hevc_qsv":
-            args += ["-tag:v", "hvc1"]
-    else:
-        crf = CRF_X265 if encoder == "libx265" else CRF_X264
-        args = [
-            "-c:v", encoder,
-            "-preset", preset,
-            "-crf", crf,
-            # Nulllatenz-Tuning: reduziert RAM-Bedarf & Lookahead-Rechenlast
-            "-tune", "zerolatency",
-            "-pix_fmt", PIXEL_FORMAT,
-            "-g", gop,                     # Keyframe alle 2 s (an fps gekoppelt)
-            "-movflags", "+faststart",     # MP4 sofort abspielbar
-        ]
-        if encoder == "libx265":
-            args += ["-tag:v", "hvc1"]
+    args = build_video_encoder_args(encoder, preset, fps)
+    args += ["-movflags", "+faststart"]     # MP4 sofort abspielbar
 
     if has_audio:
         args += [
@@ -655,46 +678,57 @@ def build_screenshot_command(output_path: str, width: int, height: int) -> list:
 
 
 def build_benchmark_command(
-    output_path: str, duration: int, fps: str = "30",
+    preset: str = "medium", fps: str = "30",
     screen_size: tuple[int, int] | None = None,
+    realtime: bool = False, encoder: str = "libx264",
 ) -> list:
     """
-    Testlauf für den Benchmark: kodiert eine feste Anzahl bewegter
-    Testbilder in der Bildschirmauflösung, so schnell die Maschine kann.
+    Ein Messlauf des Leistungstests.
 
-    Bewusst KEINE Bildschirmaufnahme mehr, sondern eine synthetische
-    Bewegtquelle (testsrc2):
-      * Sie liefert garantiert bei jedem Bild neuen Inhalt. Eine
-        Bildschirmaufnahme misst dagegen mit, wie viel sich zufällig
-        gerade auf dem Desktop bewegt - bei ruhigem Bildschirm sah
-        selbst eine überforderte Maschine gut aus.
-      * Ohne Echtzeit-Quelle läuft die Kodierung so schnell wie möglich
-        ab. Aus "Bilder geteilt durch benötigte Zeit" ergibt sich direkt
-        der Durchsatz des Encoders - genau die Zahl, die entscheidet, ob
-        30 oder 60 fps im Betrieb überhaupt erreichbar sind.
-    Die Ausgabe geht ins Nichts (-f null); es entsteht keine Datei.
+    Kodiert bewegte Testbilder (testsrc2) in Bildschirmauflösung - mit
+    GENAU den Encoder-Parametern der echten Aufnahme
+    (build_video_encoder_args) und derselben Farbumrechnung: ddagrab
+    liefert BGRA-Bilder, die vor dem Kodieren nach yuv420p umgerechnet
+    werden müssen. Deshalb erzeugt testsrc2 hier ebenfalls BGRA.
+
+    Warum eine synthetische Quelle statt einer Bildschirmaufnahme: sie
+    liefert garantiert bei jedem Bild neuen Inhalt. Eine
+    Bildschirmaufnahme misst mit, wie viel sich zufällig gerade auf dem
+    Desktop bewegt - bei ruhigem Bildschirm sah selbst eine überforderte
+    Maschine gut aus.
+
+    realtime=True:  Bilder kommen im Takt der Bildrate (wie bei einer
+                    echten Aufnahme) -> die CPU-Auslastung zeigt, was die
+                    Aufnahme die Maschine kostet.
+    realtime=False: so schnell wie möglich -> die Bilder pro Sekunde
+                    zeigen den maximalen Durchsatz des Encoders.
+
+    Fortschritt (Anzahl kodierter Bilder) kommt alle 0,5 s über stdout
+    (-progress pipe:1). Der Lauf hat kein festes Ende - der Aufrufer
+    beendet ihn nach der Messzeit; -t ist nur eine Sicherung, falls das
+    einmal nicht klappt. Die Ausgabe geht ins Nichts (-f null).
     """
     width, height = screen_size if screen_size else (1920, 1080)
     # Gerade Kantenlaengen sind Pflicht fuer yuv420p
     width -= width % 2
     height -= height % 2
 
-    try:
-        frames = max(1, int(round(float(fps) * duration)))
-    except (TypeError, ValueError):
-        frames = 30 * duration
-
-    return [
+    cmd = [
         get_ffmpeg_path(),
         "-hide_banner",
         "-loglevel", "error",
+        "-nostats",
+        "-progress", "pipe:1",
+        "-stats_period", "0.5",
         "-y",
-        "-f", "lavfi",
-        "-i", f"testsrc2=size={width}x{height}:rate={fps}",
-        "-frames:v", str(frames),
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", CRF_X264,
-        "-pix_fmt", PIXEL_FORMAT,
-        "-f", "null", "-",
     ]
+    if realtime:
+        cmd.append("-re")
+    cmd += [
+        "-f", "lavfi",
+        "-i", f"testsrc2=size={width}x{height}:rate={fps},format=bgra",
+        "-t", "300",
+    ]
+    cmd += build_video_encoder_args(encoder, preset, fps)
+    cmd += ["-an", "-f", "null", "-"]
+    return cmd

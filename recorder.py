@@ -6,6 +6,8 @@ Steuert den FFmpeg-Aufnahmeprozess in einem separaten Thread.
 Kernpunkte:
   * Sauberes Beenden über stdin-'q' -> FFmpeg schreibt den MOOV-Atom
     korrekt in die MP4-Datei (kein Datenverlust / keine kaputte Datei).
+    Danach wird gewartet, solange FFmpeg noch arbeitet - nicht nur eine
+    feste Zeit (siehe _wait_while_finalizing).
   * Pause/Resume über Prozess-Suspend (psutil.suspend/resume).
     Funktioniert auf beiden Plattformen:
       Linux   -> SIGSTOP / SIGCONT
@@ -24,6 +26,11 @@ import psutil
 
 from ffmpeg_utils import build_record_command
 from platform_utils import get_subprocess_flags
+
+# Abschluss nach dem Stoppen (siehe RecorderThread._wait_while_finalizing)
+FINALIZE_IDLE_SECONDS = 15     # so lange ohne jede Aktivitaet -> gilt als haengend
+FINALIZE_BLIND_SECONDS = 60    # Obergrenze, falls psutil keine Messwerte liefert
+FINALIZE_MAX_SECONDS = 900     # absolute Obergrenze (15 min)
 
 
 class RecorderThread(threading.Thread):
@@ -289,10 +296,8 @@ class RecorderThread(threading.Thread):
         except Exception:
             pass
 
-        # 3) Auf sauberen Abschluss warten (großzügig für alte CPUs)
-        try:
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        # 3) Auf sauberen Abschluss warten - solange FFmpeg noch arbeitet
+        if not self._wait_while_finalizing():
             try:
                 self._process.terminate()       # SIGTERM / TerminateProcess
                 self._process.wait(timeout=5)
@@ -304,6 +309,67 @@ class RecorderThread(threading.Thread):
                     pass
 
         return self._verify_output()
+
+    def _wait_while_finalizing(self) -> bool:
+        """
+        Wartet auf das Ende von FFmpeg nach dem 'q' - so lange, wie FFmpeg
+        noch erkennbar arbeitet (CPU-Zeit oder Lese-/Schreibzugriffe steigen).
+
+        Früher wurde nach festen 10 Sekunden hart beendet. Das reicht bei
+        langen Aufnahmen nicht: wegen '-movflags +faststart' schreibt
+        FFmpeg beim Abschluss die GESAMTE Datei noch einmal um (der
+        Inhaltsverzeichnis-Block wandert an den Anfang), dazu kodiert der
+        Encoder die noch gepufferten Bilder fertig. Bei mehreren GB auf
+        einer langsamen Platte dauert das deutlich länger - ein hartes
+        Beenden mittendrin hinterlässt eine unbrauchbare MP4.
+
+        Hart beendet wird nur noch, wenn sich FINALIZE_IDLE_SECONDS lang
+        gar nichts mehr tut (FFmpeg hängt) oder FINALIZE_MAX_SECONDS
+        erreicht sind.
+
+        :return: True, wenn FFmpeg von selbst beendet wurde
+        """
+        started = time.time()
+        last_activity = started
+        last_snapshot = self._activity_snapshot()
+        # Ohne psutil-Messwerte laesst sich "arbeitet noch" nicht beurteilen -
+        # dann gilt eine feste, grosszuegige Obergrenze.
+        idle_limit = FINALIZE_IDLE_SECONDS if last_snapshot is not None else FINALIZE_BLIND_SECONDS
+
+        while True:
+            try:
+                self._process.wait(timeout=1.0)
+                return True
+            except subprocess.TimeoutExpired:
+                pass
+
+            now = time.time()
+            snapshot = self._activity_snapshot()
+            if snapshot is not None and snapshot != last_snapshot:
+                last_activity = now
+                last_snapshot = snapshot
+
+            if now - last_activity > idle_limit or now - started > FINALIZE_MAX_SECONDS:
+                return False
+
+    def _activity_snapshot(self):
+        """
+        (CPU-Zeit, gelesene Bytes, geschriebene Bytes) des FFmpeg-Prozesses -
+        ändert sich der Wert, arbeitet FFmpeg noch. None, wenn psutil die
+        Werte nicht liefern kann.
+        """
+        if not self._ps_process:
+            return None
+        try:
+            cpu = self._ps_process.cpu_times()
+            cpu_total = round(cpu.user + cpu.system, 2)
+        except Exception:
+            return None
+        try:
+            io = self._ps_process.io_counters()
+            return (cpu_total, io.read_bytes, io.write_bytes)
+        except Exception:
+            return (cpu_total, 0, 0)
 
     def _verify_output(self) -> bool:
         """Prüft, ob eine verwertbare Datei entstanden ist (> 1 KB)."""

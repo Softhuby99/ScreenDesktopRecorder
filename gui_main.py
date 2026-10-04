@@ -30,8 +30,8 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from audio_devices import (
-    get_audio_sources, guess_microphone_default, guess_speaker_monitor_default,
-    list_meter_devices, looks_like_system_audio,
+    find_meter_devices_for, get_audio_sources, guess_microphone_default,
+    guess_speaker_monitor_default, list_meter_devices, looks_like_system_audio,
 )
 from audio_meter import LevelMeter
 from benchmark import BenchmarkThread
@@ -63,15 +63,22 @@ from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpe
 from gui_mini import MiniPanel
 from optimizer import (
     OPTIMIZE_PROFILES, OptimizeThread, get_profile, probe_duration_seconds,
-    probe_media_info, suggest_output_path,
+    probe_max_volume_db, probe_media_info, suggest_output_path,
 )
+
+# Lautester Moment der Tonspur unter diesem Wert -> praktisch stumm. Ein
+# funktionierendes Mikrofon erreicht selbst in einem stillen Raum durch
+# Grundrauschen deutlich hoehere Spitzen; digitale Stille (gesperrter
+# Mikrofonzugriff, stummgeschaltetes Geraet) misst -91 dB bzw. -inf.
+SILENT_AUDIO_MAX_DB = -70.0
 from gui_widgets import LevelMeterBar
 from platform_utils import (
     IS_WINDOWS, even_dimensions, get_default_videos_dir, get_platform_warning,
     open_file_manager,
 )
-from recorder import RecorderThread
+from recorder import FINALIZE_MAX_SECONDS, RecorderThread
 from region_selector import RegionSelector
+from settings_store import load_settings, save_settings
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -114,7 +121,15 @@ class MainWindow(ctk.CTk):
         self._speaker_level_meter: LevelMeter | None = None
         self._meter_poll_job = None
 
+        # Zuletzt benutzte Einstellungen (siehe settings_store.py). Die
+        # Tonquelle kann erst wiederhergestellt werden, wenn die Geraeteliste
+        # geladen ist (_apply_audio_devices) - bis dahin darf ein Speichern
+        # die gemerkte Quelle nicht mit "Kein Audio" ueberschreiben.
+        self._saved_settings: dict = load_settings()
+        self._audio_devices_loaded = False
+
         self._build_ui()
+        self._restore_settings()
         self._check_environment()
         self._load_audio_devices_async()
         self._load_meter_devices_async()
@@ -571,6 +586,67 @@ class MainWindow(ctk.CTk):
         ).pack(side="left")
         return row
 
+    # ==================================================================
+    # EINSTELLUNGEN MERKEN (siehe settings_store.py)
+    # ==================================================================
+    def _restore_settings(self):
+        """Uebernimmt die zuletzt gespeicherten Werte - ungueltige werden ignoriert."""
+        s = self._saved_settings
+        if not s:
+            return
+
+        folder = s.get("output_folder")
+        if isinstance(folder, str) and os.path.isdir(folder):
+            self.path_var.set(folder)
+        if s.get("fps") in FPS_OPTIONS:
+            self.fps_var.set(s["fps"])
+        if s.get("preset") in PRESET_OPTIONS:
+            self.preset_var.set(s["preset"])
+        encoder = s.get("encoder")
+        if encoder in ENCODER_OPTIONS and encoder != self.encoder_var.get():
+            self.encoder_var.set(encoder)
+            # Zeigt den x265-Hinweis an bzw. prueft QSV erneut und faellt
+            # bei fehlender Hardware wieder auf libx264 zurueck.
+            self._on_encoder_change(encoder)
+        try:
+            gain = float(s.get("mic_gain", MIC_GAIN_DEFAULT))
+            gain = max(MIC_GAIN_MIN, min(MIC_GAIN_MAX, gain))
+            self.mic_gain_var.set(gain)
+            self._on_gain_change(gain)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(s.get("denoise"), bool):
+            self.denoise_var.set(s["denoise"])
+
+        self.bench_status.configure(
+            text=f"Gespeicherte Einstellungen geladen: {self.fps_var.get()} FPS, "
+                 f"{self.encoder_var.get()}, Preset {self.preset_var.get()}."
+        )
+
+    def _save_settings(self):
+        try:
+            self._save_settings_unchecked()
+        except Exception:
+            pass  # Einstellungen merken ist Komfort - darf nie etwas blockieren
+
+    def _save_settings_unchecked(self):
+        data = dict(self._saved_settings)   # unbekannte Schluessel behalten
+        data.update({
+            "output_folder": self.path_var.get().strip(),
+            "fps": self.fps_var.get(),
+            "encoder": self.encoder_var.get(),
+            "preset": self.preset_var.get(),
+            "mic_gain": round(float(self.mic_gain_var.get()), 3),
+            "denoise": bool(self.denoise_var.get()),
+        })
+        if self._audio_devices_loaded:
+            label = self.audio_var.get()
+            data["audio_device"] = (
+                self.audio_map.get(label) if label != NO_AUDIO_LABEL else None
+            )
+        save_settings(data)
+        self._saved_settings = data
+
     def _set_status(self, text: str, color: str = COLOR_TEXT_MUTED):
         self.status_label.configure(text=text, text_color=color)
 
@@ -650,7 +726,29 @@ class MainWindow(ctk.CTk):
         # Text (über die gemeinsame Variable) korrekt aktualisiert wirkt.
         self.audio_menu.configure(values=values)
         self.audio_menu_audio_tab.configure(values=values)
-        self.audio_var.set(NO_AUDIO_LABEL)
+
+        # Zuletzt benutzte Tonquelle wiederherstellen - verglichen wird die
+        # FFmpeg-ID, nicht der Anzeigename (der kann sich durch das
+        # Eindeutig-Machen oben verschieben). Frueher stand hier immer
+        # "Kein Audio": wer nach einem Neustart nicht daran dachte, die
+        # Quelle neu zu waehlen, nahm stillschweigend ohne Ton auf.
+        saved_ident = self._saved_settings.get("audio_device")
+        selected = NO_AUDIO_LABEL
+        if saved_ident:
+            match = next(
+                (label for label, ident in self.audio_map.items() if ident == saved_ident),
+                None,
+            )
+            if match:
+                selected = match
+            else:
+                self._set_status(
+                    f"⚠ Zuletzt genutzte Tonquelle \"{saved_ident}\" nicht gefunden – "
+                    "bitte neu wählen (Aufnahme sonst ohne Ton).",
+                    COLOR_WARNING,
+                )
+        self._audio_devices_loaded = True
+        self.audio_var.set(selected)
 
     # ==================================================================
     # MIKROFON-/LAUTSPRECHER-VORSCHAU (Audio-Tab)
@@ -719,18 +817,54 @@ class MainWindow(ctk.CTk):
         funktioniert, über welches der beiden Dropdowns die Auswahl
         geändert wurde.
         """
+        # Waehrend einer Aufnahme nichts oeffnen - FFmpeg haelt das Geraet.
+        if self.recorder is not None:
+            return
+
         label = self.audio_var.get()
-        # looks_like_system_audio() prüft Stichworte im Klartext-Namen,
-        # nicht nur ein Emoji-Präfix - auf Windows/Fallback beginnen sonst
-        # ALLE Geräte (auch Stereo Mix/Loopback) mit "🎤", wodurch die
-        # Vorschau dort fälschlich immer die Mikrofon-Kategorie annehmen
-        # würde (siehe Modul-Kommentar in audio_devices.looks_like_system_audio).
+        ident = self.audio_map.get(label) if label != NO_AUDIO_LABEL else None
+
+        # 1) Genau das Geraet zeigen, das auch aufgenommen wird.
+        #    Frueher wurde hier unabhaengig von der Auswahl immer das erste
+        #    Mikrofon der Liste geoeffnet: der Balken schlug aus, obwohl ein
+        #    ganz anderes (evtl. stummes) Geraet aufgenommen wurde.
+        matches = find_meter_devices_for(ident) if ident else []
+        if matches:
+            self._start_mic_meter_from(matches)
+            return
+        if ident and IS_WINDOWS:
+            # Lieber ehrlich "keine Vorschau" als den Pegel eines anderen
+            # Geraets anzeigen. (Unter Linux benutzt FFmpeg PulseAudio-
+            # Quellnamen, die PortAudio nicht kennt - dort bleibt es bei
+            # der bisherigen Naeherung unten.)
+            if self._mic_level_meter:
+                self._mic_level_meter.stop()
+                self._mic_level_meter = None
+            self.mic_meter.set_unavailable("Keine Vorschau für dieses Gerät möglich")
+            return
+
+        # 2) Naeherung wie bisher: looks_like_system_audio() prüft
+        #    Stichworte im Klartext-Namen, nicht nur ein Emoji-Präfix -
+        #    auf Windows/Fallback beginnen sonst ALLE Geräte (auch Stereo
+        #    Mix/Loopback) mit "🎤" (siehe audio_devices.looks_like_system_audio).
         is_system_audio = looks_like_system_audio(label)
         idx = (
             guess_speaker_monitor_default(self._meter_devices) if is_system_audio
             else guess_microphone_default(self._meter_devices)
         )
         self._start_mic_meter(idx)
+
+    def _start_mic_meter_from(self, indices: list[int]):
+        """Probiert die Treffer der Reihe nach, bis sich einer oeffnen laesst."""
+        if self._mic_level_meter:
+            self._mic_level_meter.stop()
+            self._mic_level_meter = None
+        for index in indices:
+            meter = LevelMeter(index)
+            if meter.start():
+                self._mic_level_meter = meter
+                return
+        self.mic_meter.set_unavailable("Gerät konnte nicht geöffnet werden")
 
     def _on_speaker_device_change(self, value: str):
         idx = self._index_for_meter_name(value)
@@ -1063,10 +1197,11 @@ class MainWindow(ctk.CTk):
         self.bench_status.configure(
             text=(f"{result['message']}\n"
                   f"Ø CPU: {result['avg_cpu']} %  •  Spitze: {result['peak_cpu']} %  •  "
-                  f"Preset: {result['preset']}"),
+                  f"{result['fps']} FPS / Preset: {result['preset']}"),
             text_color=result["color"],
         )
         self._reset_bench_buttons()
+        self._save_settings()
         messagebox.showinfo(result["title"], result["message"])
 
     def _bench_error(self, message: str):
@@ -1148,6 +1283,10 @@ class MainWindow(ctk.CTk):
         # eine fehlende Audiospur in der fertigen Datei ein Befund und
         # keine voellig normale Bild-ohne-Ton-Aufnahme.
         self._recording_had_audio = bool(settings.get("audio_device")) or audio_only
+
+        # Gewaehlte Einstellungen (v. a. die Tonquelle) fuer den naechsten
+        # Programmstart merken.
+        self._save_settings()
 
         # Vorschau-Geräte freigeben, BEVOR FFmpeg versucht, dieselbe
         # Audioquelle zu öffnen (siehe _pause_meters).
@@ -1256,7 +1395,7 @@ class MainWindow(ctk.CTk):
                 self._set_optimize_file(path)
             threading.Thread(
                 target=self._check_recording_truncated,
-                args=(path, elapsed, log_path, requested_fps),
+                args=(path, elapsed, log_path, requested_fps, self._recording_had_audio),
                 daemon=True,
             ).start()
             if messagebox.askyesno(
@@ -1273,7 +1412,8 @@ class MainWindow(ctk.CTk):
             )
 
     def _check_recording_truncated(self, path: str, elapsed_seconds: float,
-                                   log_path: str | None, requested_fps: float = 0.0):
+                                   log_path: str | None, requested_fps: float = 0.0,
+                                   had_audio: bool = False):
         """
         Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
         vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
@@ -1321,13 +1461,29 @@ class MainWindow(ctk.CTk):
         if "Audio:" not in info:
             # Es wurde eine Tonquelle gewaehlt, aber es gibt gar keinen
             # Audiostream - das ist ein eindeutiger Befund, kein Verdacht.
-            if self._recording_had_audio:
+            if had_audio:
                 self._append_recording_log(
                     log_path,
                     "BEFUND: Es war eine Tonquelle ausgewaehlt, die Datei enthaelt "
                     "aber ueberhaupt keinen Audiostream.",
                 )
                 self.after(0, self._warn_no_audio_stream, log_path)
+        elif had_audio:
+            # Tonspur vorhanden - aber ist darauf auch etwas zu hoeren?
+            # (siehe optimizer.probe_max_volume_db)
+            max_db = probe_max_volume_db(path)
+            if max_db is not None:
+                self._append_recording_log(
+                    log_path, f"Tonpegel: lautester Moment {max_db:.1f} dB"
+                )
+                if max_db <= SILENT_AUDIO_MAX_DB:
+                    self._append_recording_log(
+                        log_path,
+                        "BEFUND: Die Tonspur ist vorhanden, enthaelt aber nur "
+                        "Stille (Mikrofonzugriff gesperrt, Geraet stumm oder "
+                        "falsches Geraet gewaehlt).",
+                    )
+                    self.after(0, self._warn_silent_audio, log_path)
 
         if duration < elapsed_seconds * 0.7 - 1.0:
             self._append_recording_log(
@@ -1488,6 +1644,35 @@ class MainWindow(ctk.CTk):
             f"{log_hint}",
         )
 
+    def _warn_silent_audio(self, log_path: str | None):
+        self._set_status("⚠ Tonspur ist stumm", COLOR_WARNING)
+        log_hint = (
+            f"\n\nDetails im Protokoll:\n{os.path.basename(log_path)}"
+            if log_path else ""
+        )
+        if IS_WINDOWS:
+            causes = (
+                "• Windows sperrt den Mikrofonzugriff: Einstellungen → "
+                "Datenschutz und Sicherheit → Mikrofon → \"Desktop-Apps den "
+                "Zugriff auf das Mikrofon erlauben\" einschalten.\n"
+                "• Das Mikrofon ist stummgeschaltet (Taste am Headset/Notebook "
+                "oder in der Sound-Systemsteuerung).\n"
+                "• Es ist das falsche Gerät gewählt. Den Ton vom PC selbst "
+                "(Videos, Spiele) nimmt ein Mikrofon-Eingang nicht auf – dafür "
+                "braucht es \"Stereomix\" o. Ä."
+            )
+        else:
+            causes = (
+                "• Das Mikrofon ist stummgeschaltet (pavucontrol / Systemeinstellungen).\n"
+                "• Es ist das falsche Gerät gewählt – für den Ton vom PC selbst "
+                "die \"Systemton\"-Quelle (Monitor) wählen."
+            )
+        messagebox.showwarning(
+            "Tonspur ist stumm",
+            "Die Aufnahme hat zwar eine Tonspur, darauf ist aber nichts zu hören.\n\n"
+            "Mögliche Ursachen:\n" + causes + log_hint,
+        )
+
     def _warn_unreadable_file(self, log_path: str | None):
         self._set_status("⚠ Datei beschädigt – Dauer nicht auslesbar", COLOR_DANGER)
         log_hint = (
@@ -1545,10 +1730,12 @@ class MainWindow(ctk.CTk):
         Tk-Ereignisschleife zu blockieren wie ein einzelnes langes join()
         es taete.
 
-        RecorderThread._graceful_stop() hat selbst ein Eskalations-Budget
-        von bis zu ~18s (wait 10s -> terminate+wait 5s -> kill+wait 3s),
-        um FFmpeg das MOOV-Atom sauber finalisieren zu lassen. Ein reines
-        `self.recorder.join(timeout=20)` wuerde in dieser Zeit die
+        RecorderThread._graceful_stop() wartet, solange FFmpeg noch
+        erkennbar arbeitet (Encoder leeren, MP4 per +faststart umschreiben -
+        bei grossen Dateien auch mal deutlich laenger als 10 s), und beendet
+        nur einen wirklich haengenden Prozess hart (siehe
+        RecorderThread._wait_while_finalizing). Ein reines
+        `self.recorder.join(timeout=...)` wuerde in dieser Zeit die
         Ereignisschleife komplett anhalten - unter Windows fuehrt das
         typischerweise dazu, dass das Fenster im Titel "(Keine Rückmeldung)"
         anzeigt, obwohl im Hintergrund alles wie vorgesehen laeuft. Deshalb
@@ -1562,7 +1749,9 @@ class MainWindow(ctk.CTk):
         except Exception:
             pass
 
-        deadline = time.time() + 20
+        # Der Thread entscheidet selbst, wann FFmpeg haengt - hier nur eine
+        # Sicherung oberhalb seiner eigenen Obergrenze.
+        deadline = time.time() + FINALIZE_MAX_SECONDS + 15
         while self.recorder.is_alive() and time.time() < deadline:
             self.recorder.join(timeout=0.2)
             try:
@@ -1572,7 +1761,7 @@ class MainWindow(ctk.CTk):
                 break
 
         if self.recorder.is_alive():
-            # Letzte Instanz: sollte in ~20s wirklich nichts geklappt haben
+            # Letzte Instanz: sollte selbst dann nichts geklappt haben
             # (haengender Thread), FFmpeg hart beenden statt die App ewig
             # offenzuhalten oder als Waisenprozess weiterlaufen zu lassen.
             self.recorder.force_kill()
@@ -1588,6 +1777,8 @@ class MainWindow(ctk.CTk):
                 return
             self.recorder.stop()
             self._wait_for_recorder_shutdown()
+
+        self._save_settings()
 
         if self._meter_poll_job:
             self.after_cancel(self._meter_poll_job)

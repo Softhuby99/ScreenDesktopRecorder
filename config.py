@@ -65,8 +65,19 @@ PIXEL_FORMAT = "yuv420p"
 # ----------------------------------------------------------------------------
 # BENCHMARK-ENTSCHEIDUNGSMATRIX
 # ----------------------------------------------------------------------------
-BENCHMARK_DURATION = 5          # Sekunden Testaufnahme
+BENCHMARK_DURATION = 5          # Sekunden CPU-Messung (Echtzeit-Takt)
 BENCHMARK_SAMPLE_INTERVAL = 1.0 # psutil-Messintervall
+
+# Durchsatz-Kontrolle nach der CPU-Messung (siehe benchmark.py):
+BENCHMARK_THROUGHPUT_SECONDS = 3   # Dauer je geprüftem Preset
+# Der Encoder muss die Bildrate um diesen Faktor übertreffen - Reserve für
+# Bildschirm abgreifen, Ton und andere Programme während der Aufnahme.
+BENCHMARK_HEADROOM = 1.4
+# Reihenfolge, in der bei zu geringem Durchsatz auf schnellere Presets
+# ausgewichen wird (langsam/gut -> schnell/gröber).
+BENCHMARK_PRESET_LADDER = ["medium", "faster", "veryfast", "ultrafast"]
+# 60 FPS nur mit höchstens diesem Preset - sonst lieber 30 FPS in besserer Qualität.
+BENCHMARK_MAX_PRESET_60FPS = "faster"
 
 BENCHMARK_TIERS = [
     {

@@ -255,6 +255,83 @@ def list_meter_devices() -> list[tuple[str, int]]:
     return results
 
 
+def _normalize_device_name(name: str) -> str:
+    return " ".join(str(name).lower().split())
+
+
+# Bevorzugte PortAudio-Schnittstellen fuer die Vorschau unter Windows.
+# WDM-KS wird bewusst NIE benutzt: es oeffnet das Geraet u. U. exklusiv -
+# dann koennte FFmpeg es waehrend/nach der Vorschau nicht mehr oeffnen.
+_METER_HOSTAPI_PREFERENCE = ("mme", "windows directsound", "windows wasapi")
+
+
+def find_meter_devices_for(ffmpeg_id: str | None) -> list[int]:
+    """
+    Sucht zum FÜR DIE AUFNAHME gewählten Gerät (FFmpeg-/DirectShow-Name)
+    das passende sounddevice/PortAudio-Gerät, damit die Pegelanzeige
+    genau das Gerät zeigt, das auch aufgenommen wird.
+
+    Früher hat die Vorschau unabhängig von der Auswahl einfach das erste
+    Mikrofon der Liste geöffnet. Der Balken konnte dadurch ausschlagen,
+    während ein ganz anderes (z. B. stummes) Gerät aufgenommen wurde.
+
+    Vergleich über den Gerätenamen: zuerst exakt, dann als Präfix in
+    beide Richtungen - die MME-Schnittstelle von Windows kürzt
+    Gerätenamen auf 31 Zeichen, DirectShow/WASAPI je nach Gerät nicht.
+
+    Dasselbe Gerät taucht unter Windows mehrfach auf (einmal je
+    Schnittstelle). Geliefert werden deshalb ALLE Treffer in der
+    Reihenfolge, in der sie probiert werden sollen: MME zuerst (öffnet
+    praktisch jedes Gerät mit jeder Kanalzahl), dann DirectSound, dann
+    WASAPI; innerhalb einer Schnittstelle exakter Name vor Präfix. Die
+    GUI nimmt den ersten Treffer, der sich tatsächlich öffnen lässt.
+
+    :return: PortAudio-Geräteindizes, ggf. leer (z. B. immer unter Linux,
+             wo FFmpeg PulseAudio-Quellnamen benutzt, die PortAudio so
+             nicht kennt)
+    """
+    if not ffmpeg_id:
+        return []
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return []
+
+    target = _normalize_device_name(ffmpeg_id)
+    candidates: list[tuple[int, int, int]] = []   # (API-Rang, Trefferguete, Index)
+
+    for idx, device in enumerate(devices):
+        try:
+            if device.get("max_input_channels", 0) <= 0:
+                continue
+            api_name = str(hostapis[device["hostapi"]]["name"]).lower()
+        except Exception:
+            continue
+        if "wdm-ks" in api_name:
+            continue
+
+        name = _normalize_device_name(device.get("name", ""))
+        if not name:
+            continue
+        if name == target:
+            quality = 0
+        elif min(len(name), len(target)) >= 8 and (
+            target.startswith(name) or name.startswith(target)
+        ):
+            quality = 1
+        else:
+            continue
+
+        rank = (_METER_HOSTAPI_PREFERENCE.index(api_name)
+                if api_name in _METER_HOSTAPI_PREFERENCE
+                else len(_METER_HOSTAPI_PREFERENCE))
+        candidates.append((rank, quality, idx))
+
+    return [idx for _rank, _quality, idx in sorted(candidates)]
+
+
 _SYSTEM_AUDIO_KEYWORDS = (
     "monitor", "stereo mix", "stereo-mix", "stereomix",
     "what u hear", "wave out", "loopback", "summe", "systemton",
