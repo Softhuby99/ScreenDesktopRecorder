@@ -86,6 +86,13 @@ Gerät, das auch aufgenommen wird. Ist die Tonspur einer fertigen
 Aufnahme komplett stumm (z. B. weil Windows den Mikrofonzugriff für
 Desktop-Apps sperrt), warnt die App mit den möglichen Ursachen.
 
+**Ton und Bild synchron:** Unter Windows bekommen Ton (DirectShow) und
+Bild (ddagrab) eine gemeinsame Uhr. Früher setzte FFmpeg jede Quelle für
+sich auf 0 - da die Bildquelle einige hundert ms später startet als die
+Tonquelle, kam der Ton um genau diese (schwankende) Startverzögerung zu
+spät. Für Geräte mit eigener Verzögerung (z. B. Bluetooth-Headsets) gibt
+es im Audio-Tab zusätzlich den Regler **Ton-Versatz** (±500 ms).
+
 **Ton vom PC selbst (Systemton) unter Windows:** FFmpeg kann unter
 Windows nur Aufnahmegeräte (DirectShow) öffnen. Der Ton, der aus den
 Lautsprechern kommt, ist nur aufnehmbar, wenn ein Gerät wie "Stereomix"

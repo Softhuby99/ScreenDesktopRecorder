@@ -166,6 +166,7 @@ class RecorderThread(threading.Thread):
                 # aus diesem Worker-Thread heraus ein zweites Tk-Root
                 # erzeugen (siehe platform_utils.get_screen_size-Docstring).
                 screen_size=self.settings.get("screen_size"),
+                audio_offset_ms=self.settings.get("audio_offset_ms", 0),
             )
             self.command = list(cmd)
 

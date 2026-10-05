@@ -9,8 +9,11 @@ Pfadstrategie:
   * Linux:   bevorzugt das systemweite ffmpeg aus $PATH
 
 Capture-Backends:
-  * Windows -> gdigrab (Video) + dshow (Audio)
+  * Windows -> ddagrab/gdigrab (Video) + dshow (Audio)
   * Linux   -> x11grab (Video) + pulse (Audio)
+
+Ton/Bild-Synchronisation unter Windows: siehe build_record_command und
+_build_audio_sync_filters - beide Quellen bekommen dieselbe Uhr.
 """
 
 import os
@@ -265,6 +268,7 @@ def build_video_input_args(
     mode_region: bool, region: tuple | None, fps: str,
     screen_size: tuple[int, int] | None = None,
     use_ddagrab: bool = False,
+    wallclock_sync: bool = False,
 ) -> list:
     """
     Baut die Video-Eingabeparameter für den jeweiligen Screen-Grabber.
@@ -283,6 +287,8 @@ def build_video_input_args(
     laufende GUI), wird get_screen_size() als Fallback genutzt.
     """
     args: list[str] = []
+    # Gemeinsame Uhr mit der Tonquelle (siehe build_record_command)
+    sync_args = ["-use_wallclock_as_timestamps", "1"] if wallclock_sync else []
 
     # ---------------- WINDOWS: ddagrab (bevorzugt) -----------------------
     if IS_WINDOWS and use_ddagrab:
@@ -298,11 +304,12 @@ def build_video_input_args(
             # Desktop) - solche Bereiche filtert build_record_command
             # vorher heraus und nimmt dann gdigrab.
             opts += [f"video_size={w}x{h}", f"offset_x={x}", f"offset_y={y}"]
-        return ["-f", "lavfi", "-i", "ddagrab=" + ":".join(opts)]
+        return [*sync_args, "-f", "lavfi", "-i", "ddagrab=" + ":".join(opts)]
 
     # ---------------- WINDOWS: gdigrab (Rückfallebene) -------------------
     if IS_WINDOWS:
         args += [
+            *sync_args,
             "-f", "gdigrab",
             "-framerate", str(fps),
             "-draw_mouse", "1",
@@ -369,18 +376,45 @@ def _sanitize_region(region: tuple) -> tuple[int, int, int, int]:
 # ============================================================================
 # 3) AUDIO-EINGABE (plattformabhängig)
 # ============================================================================
-def build_audio_input_args(audio_device: str | None) -> list:
+def build_audio_input_args(
+    audio_device: str | None, wallclock_sync: bool = False, offset_ms: int = 0,
+) -> list:
     """
     Baut die Audio-Eingabeparameter.
 
     Windows -> dshow  (-i audio="Mikrofon (Realtek)")
     Linux   -> pulse  (-i alsa_input.pci-0000_00_1f.3.analog-stereo)
+
+    wallclock_sync: Zeitstempel = Ankunftszeit (gemeinsame Uhr mit dem
+                    Bild, siehe build_record_command).
+    offset_ms:      manuelle Feinabstimmung ("Ton-Versatz" in der GUI) -
+                    positiv = Ton später, negativ = Ton früher. Gleicht
+                    z. B. die Eigenverzögerung von Bluetooth-Headsets aus,
+                    die kein Zeitstempel erfassen kann.
     """
     if not audio_device:
         return []
 
+    common: list[str] = []
+    if offset_ms:
+        common += ["-itsoffset", f"{offset_ms / 1000:.3f}"]
+
     if IS_WINDOWS:
+        sync_args: list[str] = []
+        if wallclock_sync:
+            sync_args = [
+                "-use_wallclock_as_timestamps", "1",
+                # Kleine Bloecke (100 ms statt Geraetestandard, oft 500 ms):
+                # Der Zeitstempel eines Blocks ist seine Ankunftszeit, also
+                # das ENDE des Blocks. _build_audio_sync_filters rechnet
+                # zwar auf den Blockanfang zurueck, aber je kleiner der
+                # Block, desto frueher beginnt der Ton in der Aufnahme und
+                # desto kleiner wirkt sich Zeitversatz bei der Zustellung aus.
+                "-audio_buffer_size", "100",
+            ]
         return [
+            *common,
+            *sync_args,
             "-f", "dshow",
             "-thread_queue_size", "1024",
             # BEWUSST KEIN -audio_buffer_size mehr.
@@ -407,6 +441,7 @@ def build_audio_input_args(audio_device: str | None) -> list:
 
     # Linux: PulseAudio / PipeWire (pipewire-pulse ist API-kompatibel)
     return [
+        *common,
         "-f", "pulse",
         "-thread_queue_size", "1024",
         "-fragment_size", "1024",
@@ -417,7 +452,41 @@ def build_audio_input_args(audio_device: str | None) -> list:
 # ============================================================================
 # 4) OUTPUT-ENCODING
 # ============================================================================
-def _build_audio_filter_args(gain: float, denoise: bool) -> list:
+def _build_audio_sync_filters() -> list[str]:
+    """
+    Filter für die Ton/Bild-Synchronisation unter Windows (nur zusammen mit
+    wallclock_sync, siehe build_record_command).
+
+    1) aselect - Ton-STAU zu Beginn verwerfen:
+       DirectShow nimmt ab dem Öffnen der Tonquelle auf. FFmpeg liest die
+       Tonpakete aber erst, wenn auch die Bildquelle bereit ist (ddagrab
+       braucht dafür einige hundert ms). Die bis dahin aufgelaufenen Pakete
+       kommen dann alle auf einmal an und tragen daher fast dieselbe
+       Ankunftszeit - als Zeitstempel unbrauchbar. Ausgewählt wird deshalb
+       erst ein Paket, das im normalen Takt ankommt (Abstand zum Vorgänger
+       ~ eigene Blocklänge); ab dann alles. Nach spätestens 3 s wird in
+       jedem Fall begonnen (Sicherung bei sehr unregelmäßiger Zustellung).
+
+    2) asetpts - Ankunftszeit -> Aufnahmezeit:
+       Ein Block kommt erst an, wenn er voll ist. Sein Zeitstempel zeigt
+       also auf das ENDE der aufgenommenen Zeitspanne; die eigene Länge
+       (NB_SAMPLES/SR) abziehen ergibt den Anfang.
+
+    In einer Simulation mit 0,15-1,2 s Startverzögerung der Bildquelle und
+    zufälligen Zustellverzögerungen lag der Rest-Versatz damit bei
+    -25 bis +37 ms (vorher: Versatz = Startverzögerung, also mehrere
+    hundert ms). Wahrnehmbar wird Versatz erst ab etwa 45 ms (Ton zu
+    früh) bzw. 125 ms (Ton zu spät).
+    """
+    expr = (
+        "if(isnan(prev_selected_t),"
+        "gte(t-start_t,3)+between(t-prev_t,0.85*samples_n/sample_rate,1.15*samples_n/sample_rate),"
+        "1)"
+    )
+    return [f"aselect=e='{expr}'", "asetpts=PTS-NB_SAMPLES/SR/TB"]
+
+
+def _build_audio_filter_args(gain: float, denoise: bool, wallclock_sync: bool = False) -> list:
     """
     Baut die '-af'-Filterkette für die Mikrofon-Aufnahme:
       - aresample: haelt die Tonspur synchron (siehe unten) - IMMER aktiv
@@ -425,8 +494,8 @@ def _build_audio_filter_args(gain: float, denoise: bool) -> list:
       - volume:    digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
       - alimiter:  Sicherheitsnetz GEGEN digitales Clipping (siehe unten)
     """
-    filters = []
-    # IMMER zuerst: haelt die Tonspur an der Zeitachse ausgerichtet und
+    filters = _build_audio_sync_filters() if wallclock_sync else []
+    # IMMER (nach den Sync-Filtern): haelt die Tonspur an der Zeitachse ausgerichtet und
     # fuellt Aussetzer der Aufnahmequelle mit Stille auf, statt die Spur
     # dort enden bzw. verrutschen zu lassen. Ohne das endet die Audiospur
     # bei einem kurzen Geraeteaussetzer schlicht vorzeitig, waehrend das
@@ -518,6 +587,7 @@ def build_video_encoder_args(encoder: str, preset: str, fps: str = "30") -> list
 def build_output_args(
     encoder: str, preset: str, has_audio: bool, audio_only: bool = False,
     gain: float = 1.0, denoise: bool = False, fps: str = "30",
+    wallclock_sync: bool = False,
 ) -> list:
     """
     Baut die Encoding-Parameter - identisch auf allen Plattformen.
@@ -530,7 +600,9 @@ def build_output_args(
     einfache Rauschunterdrückung) und werden komplett ignoriert, wenn
     has_audio=False ist.
     """
-    audio_filter_args = _build_audio_filter_args(gain, denoise) if has_audio else []
+    audio_filter_args = (
+        _build_audio_filter_args(gain, denoise, wallclock_sync) if has_audio else []
+    )
 
     if audio_only:
         return [
@@ -572,6 +644,7 @@ def build_record_command(
     gain: float = 1.0,
     denoise: bool = False,
     screen_size: tuple[int, int] | None = None,
+    audio_offset_ms: int = 0,
 ) -> list:
     """
     Setzt das vollständige FFmpeg-Aufnahmekommando zusammen.
@@ -584,7 +657,27 @@ def build_record_command(
     gain/denoise betreffen ausschließlich die Mikrofonspur (Verstärkung /
     einfache Rauschunterdrückung) und werden ignoriert, wenn kein
     audio_device gesetzt ist.
+
+    audio_offset_ms: manuelle Ton-Verschiebung (nur bei Bild + Ton).
+
+    TON/BILD-SYNCHRONISATION (Windows, Bild + Ton):
+    Ohne Zusatzmaßnahmen setzt FFmpeg JEDE Eingabe für sich auf 0 - die
+    erste Tonprobe und das erste Bild gelten als gleichzeitig. Die
+    Tonquelle wird aber zuerst geöffnet und nimmt sofort auf, die
+    Bildquelle (ddagrab) liefert ihr erstes Bild erst einige hundert ms
+    später. Genau um diese Startverzögerung kam der Ton im Video zu spät
+    - und weil sie von Start zu Start schwankt, war der Versatz nicht
+    einmal konstant.
+
+    Lösung: Beide Quellen bekommen dieselbe Uhr (Ankunftszeit beim
+    Einlesen, -use_wallclock_as_timestamps), -copyts behält diese
+    gemeinsame Zeitachse bei, und -avoid_negative_ts make_zero setzt
+    erst die fertige Datei auf 0 - für alle Spuren um denselben Betrag.
+    Die Tonspur braucht dafür noch zwei Korrekturen, siehe
+    _build_audio_sync_filters.
     """
+    wallclock_sync = IS_WINDOWS and bool(audio_device) and not audio_only
+
     cmd = [
         get_ffmpeg_path(),
         "-hide_banner",
@@ -599,6 +692,8 @@ def build_record_command(
         "-loglevel", "warning",
         "-y",
     ]
+    if wallclock_sync:
+        cmd.append("-copyts")
 
     # REIHENFOLGE DER EINGABEN IST ENTSCHEIDEND - Audio MUSS zuerst stehen.
     #
@@ -613,14 +708,17 @@ def build_record_command(
     # Reihenfolge. Steht die ddagrab-Quelle als erste Eingabe, wird sie
     # offenbar im Gleichschritt mit dem langsam eintreffenden dshow-Ton
     # abgefragt und liefert entsprechend weniger Bilder.
-    cmd += build_audio_input_args(audio_device)
+    cmd += build_audio_input_args(
+        audio_device, wallclock_sync=wallclock_sync,
+        offset_ms=0 if audio_only else int(audio_offset_ms or 0),
+    )
 
     use_ddagrab = False
     if not audio_only:
         use_ddagrab = _should_use_ddagrab(mode_region, region, screen_size)
         cmd += build_video_input_args(
             mode_region, region, fps, screen_size=screen_size,
-            use_ddagrab=use_ddagrab,
+            use_ddagrab=use_ddagrab, wallclock_sync=wallclock_sync,
         )
 
     has_audio = bool(audio_device) or audio_only
@@ -629,8 +727,12 @@ def build_record_command(
     cmd += build_video_filter_args(use_ddagrab)
     cmd += build_output_args(
         encoder, preset, has_audio, audio_only=audio_only, gain=gain, denoise=denoise,
-        fps=fps,
+        fps=fps, wallclock_sync=wallclock_sync,
     )
+    if wallclock_sync:
+        # Gemeinsame Zeitachse erst in der Datei auf 0 setzen - fuer alle
+        # Spuren um denselben Betrag, damit ihr Abstand erhalten bleibt.
+        cmd += ["-avoid_negative_ts", "make_zero"]
 
     # ABSICHTLICH KEIN "-shortest" mehr: Video- und Audio-Input laufen beide
     # durchgehend und werden gemeinsam per 'q' beendet, sollten also ohnehin

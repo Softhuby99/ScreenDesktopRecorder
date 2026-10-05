@@ -36,7 +36,8 @@ from audio_devices import (
 from audio_meter import LevelMeter
 from benchmark import BenchmarkThread
 from config import (
-    APP_NAME, APP_VERSION, AUDIO_ONLY_EXTENSION,
+    APP_NAME, APP_VERSION, AUDIO_OFFSET_MAX_MS, AUDIO_OFFSET_MIN_MS, AUDIO_OFFSET_STEPS,
+    AUDIO_ONLY_EXTENSION,
     COLOR_ACCENT, COLOR_ACCENT_HOVER, COLOR_BG_CARD, COLOR_BG_HOVER,
     COLOR_BG_INPUT, COLOR_BG_MAIN, COLOR_DANGER, COLOR_DANGER_HOVER, COLOR_SUCCESS,
     COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY, COLOR_WARNING,
@@ -472,6 +473,31 @@ class MainWindow(ctk.CTk):
             anchor="w", wraplength=410, justify="left",
         ).pack(fill="x", padx=14)
 
+        # Ton-Versatz (nur Videoaufnahmen mit Ton)
+        row = self._labeled_row(mic_card, "Ton-Versatz")
+        self.audio_offset_label = ctk.CTkLabel(
+            row, text="0 ms", font=("Segoe UI", 12),
+            text_color=COLOR_TEXT_MUTED, width=64,
+        )
+        self.audio_offset_label.pack(side="right")
+        self.audio_offset_var = ctk.IntVar(value=0)
+        ctk.CTkSlider(
+            row, from_=AUDIO_OFFSET_MIN_MS, to=AUDIO_OFFSET_MAX_MS,
+            number_of_steps=AUDIO_OFFSET_STEPS, variable=self.audio_offset_var,
+            command=self._on_audio_offset_change,
+            fg_color=COLOR_BG_INPUT, progress_color=COLOR_BG_INPUT,
+            button_color=COLOR_ACCENT, button_hover_color=COLOR_ACCENT_HOVER,
+        ).pack(side="right", fill="x", expand=True, padx=(0, 10))
+
+        ctk.CTkLabel(
+            mic_card,
+            text="Nur bei Videoaufnahmen. Kommt der Ton im Video zu spät "
+                 "(z. B. bei Bluetooth-Headsets), nach links schieben – "
+                 "zu früh: nach rechts. Normalerweise 0 lassen.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+            anchor="w", wraplength=410, justify="left",
+        ).pack(fill="x", padx=14)
+
         self.denoise_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
             mic_card, text="Rauschunterdrückung (Aufnahme, experimentell)",
@@ -617,11 +643,24 @@ class MainWindow(ctk.CTk):
             pass
         if isinstance(s.get("denoise"), bool):
             self.denoise_var.set(s["denoise"])
+        try:
+            offset = int(s.get("audio_offset_ms", 0))
+            offset = max(AUDIO_OFFSET_MIN_MS, min(AUDIO_OFFSET_MAX_MS, offset))
+            self.audio_offset_var.set(offset)
+            self._on_audio_offset_change(offset)
+        except (TypeError, ValueError):
+            pass
 
         self.bench_status.configure(
             text=f"Gespeicherte Einstellungen geladen: {self.fps_var.get()} FPS, "
                  f"{self.encoder_var.get()}, Preset {self.preset_var.get()}."
         )
+
+    def _audio_offset_ms(self) -> int:
+        try:
+            return int(round(float(self.audio_offset_var.get()) / 10.0) * 10)
+        except Exception:
+            return 0
 
     def _save_settings(self):
         try:
@@ -638,6 +677,7 @@ class MainWindow(ctk.CTk):
             "preset": self.preset_var.get(),
             "mic_gain": round(float(self.mic_gain_var.get()), 3),
             "denoise": bool(self.denoise_var.get()),
+            "audio_offset_ms": self._audio_offset_ms(),
         })
         if self._audio_devices_loaded:
             label = self.audio_var.get()
@@ -874,6 +914,10 @@ class MainWindow(ctk.CTk):
 
     def _on_gain_change(self, value):
         self.mic_gain_label.configure(text=f"{float(value):.1f}×")
+
+    def _on_audio_offset_change(self, value):
+        ms = int(round(float(value) / 10.0) * 10)
+        self.audio_offset_label.configure(text=f"{ms:+d} ms" if ms else "0 ms")
 
     def _start_mic_meter(self, index: int | None):
         if self._mic_level_meter:
@@ -1267,6 +1311,7 @@ class MainWindow(ctk.CTk):
             "audio_only": audio_only,
             "gain": self.mic_gain_var.get(),
             "denoise": self.denoise_var.get(),
+            "audio_offset_ms": self._audio_offset_ms(),
             # Auf dem GUI-Thread ermittelt - siehe _current_screen_size().
             "screen_size": self._current_screen_size(),
         }

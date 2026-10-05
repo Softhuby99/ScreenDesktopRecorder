@@ -133,3 +133,10 @@ MIC_GAIN_MIN = 0.5
 MIC_GAIN_MAX = 3.0
 MIC_GAIN_DEFAULT = 1.0
 MIC_GAIN_STEPS = 25          # Schrittweite des Sliders
+
+# Manuelle Ton-Verschiebung bei Videoaufnahmen ("Ton-Versatz", in ms).
+# Negativ = Ton früher, positiv = Ton später. Für die Eigenverzögerung
+# mancher Geräte (v. a. Bluetooth-Headsets), die kein Zeitstempel erfasst.
+AUDIO_OFFSET_MIN_MS = -500
+AUDIO_OFFSET_MAX_MS = 500
+AUDIO_OFFSET_STEPS = 100     # -> 10-ms-Schritte
