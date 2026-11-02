@@ -12,8 +12,8 @@ Capture-Backends:
   * Windows -> ddagrab/gdigrab (Video) + dshow (Audio)
   * Linux   -> x11grab (Video) + pulse (Audio)
 
-Ton/Bild-Synchronisation unter Windows: siehe build_record_command und
-_build_audio_sync_filters - beide Quellen bekommen dieselbe Uhr.
+Native Aufnahmezeitstempel bleiben erhalten; keine Umdeutung in Paketankunftszeiten.
+Ein verbleibender Geräte-/Startversatz kann manuell kalibriert werden.
 """
 
 import os
@@ -287,8 +287,9 @@ def build_video_input_args(
     laufende GUI), wird get_screen_size() als Fallback genutzt.
     """
     args: list[str] = []
-    # Gemeinsame Uhr mit der Tonquelle (siehe build_record_command)
-    sync_args = ["-use_wallclock_as_timestamps", "1"] if wallclock_sync else []
+    # wallclock_sync bleibt fuer alte Diagnose-Skripte als Parameter erhalten.
+    # Empfangszeitstempel verlieren die Zeitinformation gepufferter Pakete.
+    sync_args = []
 
     # ---------------- WINDOWS: ddagrab (bevorzugt) -----------------------
     if IS_WINDOWS and use_ddagrab:
@@ -385,8 +386,7 @@ def build_audio_input_args(
     Windows -> dshow  (-i audio="Mikrofon (Realtek)")
     Linux   -> pulse  (-i alsa_input.pci-0000_00_1f.3.analog-stereo)
 
-    wallclock_sync: Zeitstempel = Ankunftszeit (gemeinsame Uhr mit dem
-                    Bild, siehe build_record_command).
+    wallclock_sync: veralteter Kompatibilitaetsparameter, ohne Wirkung.
     offset_ms:      manuelle Feinabstimmung ("Ton-Versatz" in der GUI) -
                     positiv = Ton später, negativ = Ton früher. Gleicht
                     z. B. die Eigenverzögerung von Bluetooth-Headsets aus,
@@ -401,17 +401,6 @@ def build_audio_input_args(
 
     if IS_WINDOWS:
         sync_args: list[str] = []
-        if wallclock_sync:
-            sync_args = [
-                "-use_wallclock_as_timestamps", "1",
-                # Kleine Bloecke (100 ms statt Geraetestandard, oft 500 ms):
-                # Der Zeitstempel eines Blocks ist seine Ankunftszeit, also
-                # das ENDE des Blocks. _build_audio_sync_filters rechnet
-                # zwar auf den Blockanfang zurueck, aber je kleiner der
-                # Block, desto frueher beginnt der Ton in der Aufnahme und
-                # desto kleiner wirkt sich Zeitversatz bei der Zustellung aus.
-                "-audio_buffer_size", "100",
-            ]
         return [
             *common,
             *sync_args,
@@ -453,37 +442,8 @@ def build_audio_input_args(
 # 4) OUTPUT-ENCODING
 # ============================================================================
 def _build_audio_sync_filters() -> list[str]:
-    """
-    Filter für die Ton/Bild-Synchronisation unter Windows (nur zusammen mit
-    wallclock_sync, siehe build_record_command).
-
-    1) aselect - Ton-STAU zu Beginn verwerfen:
-       DirectShow nimmt ab dem Öffnen der Tonquelle auf. FFmpeg liest die
-       Tonpakete aber erst, wenn auch die Bildquelle bereit ist (ddagrab
-       braucht dafür einige hundert ms). Die bis dahin aufgelaufenen Pakete
-       kommen dann alle auf einmal an und tragen daher fast dieselbe
-       Ankunftszeit - als Zeitstempel unbrauchbar. Ausgewählt wird deshalb
-       erst ein Paket, das im normalen Takt ankommt (Abstand zum Vorgänger
-       ~ eigene Blocklänge); ab dann alles. Nach spätestens 3 s wird in
-       jedem Fall begonnen (Sicherung bei sehr unregelmäßiger Zustellung).
-
-    2) asetpts - Ankunftszeit -> Aufnahmezeit:
-       Ein Block kommt erst an, wenn er voll ist. Sein Zeitstempel zeigt
-       also auf das ENDE der aufgenommenen Zeitspanne; die eigene Länge
-       (NB_SAMPLES/SR) abziehen ergibt den Anfang.
-
-    In einer Simulation mit 0,15-1,2 s Startverzögerung der Bildquelle und
-    zufälligen Zustellverzögerungen lag der Rest-Versatz damit bei
-    -25 bis +37 ms (vorher: Versatz = Startverzögerung, also mehrere
-    hundert ms). Wahrnehmbar wird Versatz erst ab etwa 45 ms (Ton zu
-    früh) bzw. 125 ms (Ton zu spät).
-    """
-    expr = (
-        "if(isnan(prev_selected_t),"
-        "gte(t-start_t,3)+between(t-prev_t,0.85*samples_n/sample_rate,1.15*samples_n/sample_rate),"
-        "1)"
-    )
-    return [f"aselect=e='{expr}'", "asetpts=PTS-NB_SAMPLES/SR/TB"]
+    """Kompatibilitaet fuer alte Testskripte; native PTS nicht verschieben."""
+    return []
 
 
 def _build_audio_filter_args(gain: float, denoise: bool, wallclock_sync: bool = False) -> list:
@@ -494,13 +454,9 @@ def _build_audio_filter_args(gain: float, denoise: bool, wallclock_sync: bool = 
       - volume:    digitale Verstärkung/Abschwächung (Wunsch: "Lautstärke vom Mikro")
       - alimiter:  Sicherheitsnetz GEGEN digitales Clipping (siehe unten)
     """
-    filters = _build_audio_sync_filters() if wallclock_sync else []
-    # IMMER (nach den Sync-Filtern): haelt die Tonspur an der Zeitachse ausgerichtet und
-    # fuellt Aussetzer der Aufnahmequelle mit Stille auf, statt die Spur
-    # dort enden bzw. verrutschen zu lassen. Ohne das endet die Audiospur
-    # bei einem kurzen Geraeteaussetzer schlicht vorzeitig, waehrend das
-    # Bild weiterlaeuft ("Ton ist nur kurz", Datei aber volle Laenge).
-    filters.append("aresample=async=1")
+    # Nur Luecken anhand vorhandener PTS ausgleichen. Das synchronisiert
+    # keine unabhaengigen Uhren und ersetzt keine Startversatzmessung.
+    filters = ["aresample=async=1"]
     if denoise:
         filters.append("afftdn")
     boosted = gain is not None and gain > 1.0 + 0.005
@@ -615,6 +571,8 @@ def build_output_args(
         ]
 
     args = build_video_encoder_args(encoder, preset, fps)
+    # Relative native PTS: CFR darf Luecken fuellen, keine Unix-Epoche.
+    args += ["-fps_mode", "cfr", "-r", str(fps)]
     args += ["-movflags", "+faststart"]     # MP4 sofort abspielbar
 
     if has_audio:
@@ -660,23 +618,14 @@ def build_record_command(
 
     audio_offset_ms: manuelle Ton-Verschiebung (nur bei Bild + Ton).
 
-    TON/BILD-SYNCHRONISATION (Windows, Bild + Ton):
-    Ohne Zusatzmaßnahmen setzt FFmpeg JEDE Eingabe für sich auf 0 - die
-    erste Tonprobe und das erste Bild gelten als gleichzeitig. Die
-    Tonquelle wird aber zuerst geöffnet und nimmt sofort auf, die
-    Bildquelle (ddagrab) liefert ihr erstes Bild erst einige hundert ms
-    später. Genau um diese Startverzögerung kam der Ton im Video zu spät
-    - und weil sie von Start zu Start schwankt, war der Versatz nicht
-    einmal konstant.
-
-    Lösung: Beide Quellen bekommen dieselbe Uhr (Ankunftszeit beim
-    Einlesen, -use_wallclock_as_timestamps), -copyts behält diese
-    gemeinsame Zeitachse bei, und -avoid_negative_ts make_zero setzt
-    erst die fertige Datei auf 0 - für alle Spuren um denselben Betrag.
-    Die Tonspur braucht dafür noch zwei Korrekturen, siehe
-    _build_audio_sync_filters.
+    Native PTS beibehalten (Referenz B02): kein copyts/Wallclock und keine
+    heuristische Blockverwerfung. DirectShow und ddagrab haben verschiedene
+    Zeiturspruenge; isync waere ohne explizite Uhrenabbildung falsch.
+    audio_offset_ms korrigiert einen gemessenen konstanten Versatz.
     """
-    wallclock_sync = IS_WINDOWS and bool(audio_device) and not audio_only
+    if audio_only and not audio_device:
+        raise ValueError("Fuer eine Tonaufnahme muss eine Audioquelle gewaehlt sein.")
+    wallclock_sync = False
 
     cmd = [
         get_ffmpeg_path(),
@@ -692,8 +641,6 @@ def build_record_command(
         "-loglevel", "warning",
         "-y",
     ]
-    if wallclock_sync:
-        cmd.append("-copyts")
 
     # REIHENFOLGE DER EINGABEN IST ENTSCHEIDEND - Audio MUSS zuerst stehen.
     #
@@ -722,6 +669,11 @@ def build_record_command(
         )
 
     has_audio = bool(audio_device) or audio_only
+    # Explizite Pflichtspuren statt automatischer Streamauswahl.
+    if audio_device:
+        cmd += ["-map", "0:a:0"]
+    if not audio_only:
+        cmd += ["-map", "1:v:0" if audio_device else "0:v:0"]
     # Muss VOR den Encoder-Optionen stehen: holt die GPU-Bilder von
     # ddagrab in den Hauptspeicher (bei gdigrab/x11grab leer).
     cmd += build_video_filter_args(use_ddagrab)
@@ -729,11 +681,6 @@ def build_record_command(
         encoder, preset, has_audio, audio_only=audio_only, gain=gain, denoise=denoise,
         fps=fps, wallclock_sync=wallclock_sync,
     )
-    if wallclock_sync:
-        # Gemeinsame Zeitachse erst in der Datei auf 0 setzen - fuer alle
-        # Spuren um denselben Betrag, damit ihr Abstand erhalten bleibt.
-        cmd += ["-avoid_negative_ts", "make_zero"]
-
     # ABSICHTLICH KEIN "-shortest" mehr: Video- und Audio-Input laufen beide
     # durchgehend und werden gemeinsam per 'q' beendet, sollten also ohnehin
     # fast exakt gleich lang sein. "-shortest" beendet die GESAMTE Ausgabe

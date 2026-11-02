@@ -22,5 +22,12 @@ bin/ffmpeg
 .vscode/
 .idea/
 *.bak
+*.orig
 .DS_Store
 Thumbs.db
+
+# Ausgaben der historischen Diagnose-Skripte (siehe tools/README.md)
+tools/messungen/
+
+# pytest
+.pytest_cache/

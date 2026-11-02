@@ -168,6 +168,12 @@ class MiniPanel(ctk.CTkToplevel):
             self.pause_btn.configure(text="⏸  Pause")
 
     def _handle_stop(self):
+        # Nach dem Stopp kein Pausieren mehr - weder per Leertaste noch per Klick.
+        try:
+            self.unbind("<space>")
+        except Exception:
+            pass
+        self.on_pause = None
         self.stop_btn.configure(state="disabled", text="...")
         self.pause_btn.configure(state="disabled")
         if self.on_stop:

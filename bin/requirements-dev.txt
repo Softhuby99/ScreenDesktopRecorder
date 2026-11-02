@@ -1,0 +1,3 @@
+# Nur fuer die Entwicklung (Tests) - keine Laufzeit-Abhaengigkeit der App.
+-r requirements.txt
+pytest>=7

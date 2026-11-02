@@ -89,7 +89,45 @@ def get_profile(profile_id: str) -> dict:
 _DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 
-def probe_duration_seconds(path: str, timeout: int = 10) -> float | None:
+def _run_stderr(cmd: list, timeout: float, on_process=None) -> bytes:
+    """
+    Führt ein kurzes FFmpeg-Kommando aus und liefert dessen stderr.
+
+    on_process=None: wie bisher per subprocess.run.
+    on_process gesetzt: eigener Popen, der dem Aufrufer VOR dem Warten
+    gemeldet wird (on_process(proc)) - so kann ein Worker die Sondierung
+    per cancel() beenden. Ein beendeter/getöteter Prozess liefert dann
+    einfach (unvollständiges) stderr.
+    """
+    if on_process is None:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, **get_subprocess_flags(),
+        )
+        return proc.stderr or b""
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        **get_subprocess_flags(),
+    )
+    try:
+        on_process(proc)
+        try:
+            _out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        return err or b""
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def probe_duration_seconds(path: str, timeout: int = 10, on_process=None) -> float | None:
     """
     Ermittelt die Videodauer in Sekunden - für den Fortschrittsbalken
     (Prozent = bereits verarbeitete Zeit / Gesamtdauer). Nutzt bewusst
@@ -97,14 +135,13 @@ def probe_duration_seconds(path: str, timeout: int = 10) -> float | None:
     ohnehin nur FFmpeg selbst als externe Abhängigkeit voraussetzt.
     Liefert None bei jedem Fehler - der Aufrufer zeigt dann einen
     unbestimmten Fortschritt ("läuft ...") statt eines Prozentwerts an.
+
+    on_process: optionaler Callback(Popen) - siehe _run_stderr.
     """
     try:
-        proc = subprocess.run(
-            [get_ffmpeg_path(), "-hide_banner", "-i", path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=timeout, **get_subprocess_flags(),
-        )
-        text = proc.stderr.decode("utf-8", errors="ignore")
+        err = _run_stderr([get_ffmpeg_path(), "-hide_banner", "-i", path],
+                          timeout, on_process)
+        text = err.decode("utf-8", errors="ignore")
         match = _DURATION_RE.search(text)
         if not match:
             return None
@@ -114,7 +151,7 @@ def probe_duration_seconds(path: str, timeout: int = 10) -> float | None:
         return None
 
 
-def probe_media_info(path: str, timeout: int = 10) -> str:
+def probe_media_info(path: str, timeout: int = 10, on_process=None) -> str:
     """
     Liefert die Roh-Ausgabe von `ffmpeg -i <datei>` (Containerkopf samt
     aller Streams).
@@ -124,14 +161,13 @@ def probe_media_info(path: str, timeout: int = 10) -> str:
     oder vorzeitig endet - genau das war der blinde Fleck bei der
     Windows-Diagnose ("Datei volle Laenge, aber Ton nur kurz"). Die
     Stream-Zeilen zeigen Video und Audio dagegen getrennt.
+
+    on_process: optionaler Callback(Popen) - siehe _run_stderr.
     """
     try:
-        proc = subprocess.run(
-            [get_ffmpeg_path(), "-hide_banner", "-i", path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=timeout, **get_subprocess_flags(),
-        )
-        text = proc.stderr.decode("utf-8", errors="ignore").strip()
+        err = _run_stderr([get_ffmpeg_path(), "-hide_banner", "-i", path],
+                          timeout, on_process)
+        text = err.decode("utf-8", errors="ignore").strip()
         # "At least one output file must be specified" ist nur die
         # erwartete Beschwerde darueber, dass hier bewusst kein
         # Ausgabeziel angegeben wird - im Protokoll waere sie irrefuehrend.
@@ -145,7 +181,8 @@ def probe_media_info(path: str, timeout: int = 10) -> str:
 _MAX_VOLUME_RE = re.compile(r"max_volume:\s*(-?inf|-?\d+(?:\.\d+)?)\s*dB")
 
 
-def probe_max_volume_db(path: str, max_seconds: int = 600, timeout: int = 180) -> float | None:
+def probe_max_volume_db(path: str, max_seconds: int = 600, timeout: int = 180,
+                        on_process=None) -> float | None:
     """
     Lautester Moment der ersten Tonspur in dB (0 dB = Vollaussteuerung).
 
@@ -159,18 +196,19 @@ def probe_max_volume_db(path: str, max_seconds: int = 600, timeout: int = 180) -
     Untersucht höchstens die ersten max_seconds Sekunden, damit die
     Prüfung auch nach sehr langen Aufnahmen schnell fertig ist.
 
+    on_process: optionaler Callback(Popen) - siehe _run_stderr.
+
     :return: dB-Wert (ggf. float('-inf')) oder None, wenn nicht ermittelbar
     """
     try:
-        proc = subprocess.run(
+        err = _run_stderr(
             [get_ffmpeg_path(), "-hide_banner", "-nostats",
              "-t", str(max_seconds), "-i", path,
              "-map", "0:a:0", "-vn", "-sn", "-dn",
              "-af", "volumedetect", "-f", "null", "-"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            timeout=timeout, **get_subprocess_flags(),
+            timeout, on_process,
         )
-        text = proc.stderr.decode("utf-8", errors="ignore")
+        text = err.decode("utf-8", errors="ignore")
         match = _MAX_VOLUME_RE.search(text)
         if not match:
             return None
@@ -258,16 +296,49 @@ class OptimizeThread(threading.Thread):
 
         self._process: subprocess.Popen | None = None
         self._cancelled = threading.Event()
+        # Schützt Abbruch-Flag und Prozessveröffentlichung (siehe cancel)
+        self._lock = threading.Lock()
         self._stderr_buffer: list[str] = []
 
     def cancel(self):
-        """Bricht die laufende Optimierung ab und räumt die unfertige Ausgabedatei weg."""
-        self._cancelled.set()
-        if self._process and self._process.poll() is None:
-            try:
-                self._process.kill()
-            except Exception:
-                pass
+        """
+        Bricht die laufende Optimierung ab (wirkt in jedem Zustand, auch
+        während der Dauer-Sondierung). Die unfertige Ausgabedatei räumt
+        run() danach selbst weg.
+        """
+        with self._lock:
+            self._cancelled.set()
+            process = self._process
+        _kill_quietly(process)
+
+    def kill(self):
+        """Hart beenden (nach Ablauf des Wartebudgets beim Schließen)."""
+        self.cancel()
+        self._cleanup_partial()
+
+    def _publish_process(self, process):
+        """
+        Veröffentlicht einen bereits gestarteten Prozess (Dauer-Sondierung)
+        unter dem Lock und prüft danach erneut auf Abbruch.
+        """
+        with self._lock:
+            self._process = process
+            cancelled = self._cancelled.is_set()
+        if cancelled:
+            _kill_quietly(process)
+
+    def _start_process(self, cmd: list):
+        """Startet FFmpeg nur ohne Abbruch; Veröffentlichung unter demselben Lock."""
+        with self._lock:
+            if self._cancelled.is_set():
+                return None
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **get_subprocess_flags(),
+            )
+            return self._process
 
     def _emit(self, callback, *args):
         if callback:
@@ -278,34 +349,39 @@ class OptimizeThread(threading.Thread):
 
     def run(self):
         try:
-            duration = probe_duration_seconds(self.input_path)
+            if self._cancelled.is_set():
+                self._cleanup_partial()
+                return
+            duration = probe_duration_seconds(self.input_path,
+                                              on_process=self._publish_process)
+            if self._cancelled.is_set():
+                self._cleanup_partial()
+                return
             cmd = build_optimize_command(self.input_path, self.output_path, self.profile)
 
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                **get_subprocess_flags(),
-            )
+            process = self._start_process(cmd)
+            if process is None:
+                self._cleanup_partial()
+                return
 
             # stderr im Hintergrund leeren (wie bei RecorderThread) -
             # verhindert einen Pipe-Deadlock, falls FFmpeg doch mehr als
             # erwartet nach stderr schreibt, während wir stdout lesen.
-            threading.Thread(target=self._drain_stderr, daemon=True).start()
+            threading.Thread(target=self._drain_stderr, args=(process,), daemon=True).start()
 
-            self._read_progress(duration)
+            self._read_progress(duration, process)
 
             try:
-                self._process.wait(timeout=15)
+                process.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=5)
+                process.kill()
+                process.wait(timeout=5)
 
             if self._cancelled.is_set():
                 self._cleanup_partial()
                 return
 
-            if self._process.returncode == 0 and self._verify_output():
+            if process.returncode == 0 and self._verify_output():
                 original_bytes = _safe_size(self.input_path)
                 new_bytes = _safe_size(self.output_path)
                 self._emit(self.on_progress, 100.0)
@@ -319,19 +395,21 @@ class OptimizeThread(threading.Thread):
                 )
         except FileNotFoundError as exc:
             self._cleanup_partial()
-            self._emit(self.on_error, str(exc))
+            if not self._cancelled.is_set():
+                self._emit(self.on_error, str(exc))
         except Exception as exc:
             self._cleanup_partial()
-            self._emit(self.on_error, f"Optimierung fehlgeschlagen: {exc}")
+            if not self._cancelled.is_set():
+                self._emit(self.on_error, f"Optimierung fehlgeschlagen: {exc}")
 
-    def _read_progress(self, duration: float | None):
+    def _read_progress(self, duration: float | None, process=None):
         """
         Liest die -progress-Ausgabe von stdout zeilenweise und meldet den
         Fortschritt (falls duration bekannt ist) als Prozentwert 0-100.
         """
-        if not self._process or not self._process.stdout:
+        if process is None or not getattr(process, "stdout", None):
             return
-        for raw in iter(self._process.stdout.readline, b""):
+        for raw in iter(process.stdout.readline, b""):
             if self._cancelled.is_set():
                 break
             line = raw.decode("utf-8", errors="ignore").strip()
@@ -354,9 +432,11 @@ class OptimizeThread(threading.Thread):
             else:
                 self._emit(self.on_progress, None)
 
-    def _drain_stderr(self):
+    def _drain_stderr(self, process=None):
+        if process is None or not getattr(process, "stderr", None):
+            return
         try:
-            for raw in iter(self._process.stderr.readline, b""):
+            for raw in iter(process.stderr.readline, b""):
                 line = raw.decode("utf-8", errors="ignore").rstrip()
                 if line:
                     self._stderr_buffer.append(line)
@@ -379,6 +459,17 @@ class OptimizeThread(threading.Thread):
                 os.remove(self.output_path)
         except Exception:
             pass
+
+
+def _kill_quietly(process):
+    """Beendet einen noch laufenden Prozess hart; Fehler werden geschluckt."""
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.kill()
+    except Exception:
+        pass
 
 
 def _safe_size(path: str) -> int:

@@ -14,14 +14,14 @@ verschiedene) - was er tut, hängt vom gerade aktiven Tab ab. Das hält die
 Bedienung konsistent: "welcher Tab ist offen" entscheidet "was wird
 aufgenommen".
 
-Thread-Sicherheit: Worker-Threads (Benchmark, Recorder, Level-Meter) rufen
-NIEMALS direkt Tkinter-Methoden auf. Sie nutzen ausschließlich
-self.after(0, ...), wodurch die Aktion in die Event-Loop des GUI-Threads
-eingereiht wird.
+Thread-Sicherheit: Worker-Threads (Benchmark, Recorder, Optimierung,
+Diagnose, Geräteerkennung) rufen NIEMALS direkt Tkinter-Methoden auf. Sie
+nutzen ausschließlich self._post_to_gui(...), das die Aktion per
+self.after(0, ...) in die Event-Loop des GUI-Threads einreiht - und im
+Zustand "schließt" alles außer Protokoll und Statuszeile verwirft.
 """
 
 import os
-import re
 import threading
 import time
 from datetime import datetime
@@ -60,18 +60,20 @@ try:
 except ImportError:
     BUILD_STAMP = "dev"
 
+from diagnosis import (
+    SILENT_AUDIO_MAX_DB, DiagnosisThread, fps_log_line, parse_achieved_fps,
+    silent_audio_hint,
+)
 from ffmpeg_utils import check_encoder_available, check_qsv_available, get_ffmpeg_path
+from gui_logic import (
+    CLOSE_CANCEL, CLOSE_SAVE, close_choice, log_stderr, post_allowed,
+    recording_running, recording_source_kind, remove_partial_output,
+    wait_for_recorder_startup, wait_for_workers,
+)
 from gui_mini import MiniPanel
 from optimizer import (
-    OPTIMIZE_PROFILES, OptimizeThread, get_profile, probe_duration_seconds,
-    probe_max_volume_db, probe_media_info, suggest_output_path,
+    OPTIMIZE_PROFILES, OptimizeThread, get_profile, suggest_output_path,
 )
-
-# Lautester Moment der Tonspur unter diesem Wert -> praktisch stumm. Ein
-# funktionierendes Mikrofon erreicht selbst in einem stillen Raum durch
-# Grundrauschen deutlich hoehere Spitzen; digitale Stille (gesperrter
-# Mikrofonzugriff, stummgeschaltetes Geraet) misst -91 dB bzw. -inf.
-SILENT_AUDIO_MAX_DB = -70.0
 from gui_widgets import LevelMeterBar
 from platform_utils import (
     IS_WINDOWS, even_dimensions, get_default_videos_dir, get_platform_warning,
@@ -107,8 +109,19 @@ class MainWindow(ctk.CTk):
         self.recorder: RecorderThread | None = None
         self.mini_panel: MiniPanel | None = None
         self.benchmark_thread: BenchmarkThread | None = None
+        self._diagnosis_thread: DiagnosisThread | None = None
         self._timer_job = None
+        self._region_job = None
         self._blink_state = True
+
+        # Schließen (siehe _on_close): "schließt" erst nach Ja/Nein der
+        # Rückfrage; _close_dialog_open schützt die offene Rückfrage vor
+        # einem zweiten _on_close.
+        self._closing = False
+        self._close_dialog_open = False
+        self._close_overlay = None
+        # Quelltyp der laufenden Aufnahme (siehe gui_logic.recording_source_kind)
+        self._recording_source_kind = "unbekannt"
 
         # Video nachträglich verkleinern (siehe optimizer.py/_build_optimize_card)
         self._optimize_input_path: str | None = None
@@ -690,6 +703,31 @@ class MainWindow(ctk.CTk):
     def _set_status(self, text: str, color: str = COLOR_TEXT_MUTED):
         self.status_label.configure(text=text, text_color=color)
 
+    def _post_to_gui(self, fn, *args):
+        """
+        Einziger Weg, auf dem Worker-/Hintergrund-Threads etwas im GUI-Thread
+        ausführen lassen. Im Zustand "schließt" wird alles außer der
+        Erlaubt-Liste (Protokoll schreiben, Statuszeile) verworfen - so
+        öffnet kein Warnpfad und kein Worker-Callback mehr einen Dialog.
+        Fehler bei bereits zerstörtem Fenster werden geschluckt.
+        """
+        if not post_allowed(self._closing, fn):
+            return
+        try:
+            self.after(0, self._run_posted, fn, args)
+        except Exception:
+            pass
+
+    def _run_posted(self, fn, args):
+        """Führt einen Auftrag aus _post_to_gui im GUI-Thread aus (erneute Prüfung)."""
+        if not post_allowed(self._closing, fn):
+            return
+        try:
+            fn(*args)
+        except Exception:
+            if not self._closing:
+                raise
+
     def _current_screen_size(self) -> tuple[int, int]:
         """
         Ermittelt die Bildschirmauflösung ÜBER DAS BEREITS VORHANDENE
@@ -735,7 +773,7 @@ class MainWindow(ctk.CTk):
                 sources = get_audio_sources()
             except Exception:
                 sources = []
-            self.after(0, lambda: self._apply_audio_devices(sources))
+            self._post_to_gui(self._apply_audio_devices, sources)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -804,7 +842,7 @@ class MainWindow(ctk.CTk):
                 devices = list_meter_devices()
             except Exception:
                 devices = []
-            self.after(0, lambda: self._apply_meter_devices(devices))
+            self._post_to_gui(self._apply_meter_devices, devices)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -966,6 +1004,8 @@ class MainWindow(ctk.CTk):
         self._start_speaker_meter(speaker_idx)
 
     def _poll_meters(self):
+        if self._closing:
+            return  # keine neuen after-Schleifen im Zustand "schließt"
         if self._mic_level_meter:
             rms, peak = self._mic_level_meter.get_level()
             self.mic_meter.set_level(rms, peak)
@@ -978,15 +1018,20 @@ class MainWindow(ctk.CTk):
     # EVENT-HANDLER
     # ==================================================================
     def _on_mode_change(self, value: str):
+        if self._closing:
+            return
         if value == MODE_REGION:
             self.region_label.configure(text="")
             self.withdraw()
-            self.after(220, self._open_region_selector)
+            self._region_job = self.after(220, self._open_region_selector)
         else:
             self.region = None
             self.region_label.configure(text="")
 
     def _open_region_selector(self):
+        self._region_job = None
+        if self._closing:
+            return
         try:
             result = RegionSelector(self).select()
         finally:
@@ -1003,6 +1048,8 @@ class MainWindow(ctk.CTk):
             self.region_label.configure(text="")
 
     def _on_encoder_change(self, value: str):
+        if self._closing:
+            return  # im Zustand "schließt" keine neuen Prüf-Threads
         # WICHTIG: sowohl der libx265-Verfügbarkeitscheck als auch der neue
         # QSV-Hardwarecheck laufen NIE mehr synchron auf dem GUI-Thread -
         # beide starten echte FFmpeg-Testkodierungen, die je nach Hardware
@@ -1041,25 +1088,19 @@ class MainWindow(ctk.CTk):
         """
         Führt eine (potenziell langsame) Encoder-Verfügbarkeitsprüfung in
         einem Hintergrund-Thread aus und wendet das Ergebnis anschließend
-        über self.after(0, ...) sicher im GUI-Thread an.
+        über self._post_to_gui(...) sicher im GUI-Thread an.
         """
         def worker():
             try:
                 available = check_fn(encoder)
             except Exception:
                 available = False
-            # Falls die App inzwischen geschlossen wurde (self.destroy()
-            # bereits gelaufen), waere self.after(...) hier ein Zugriff auf
-            # ein bereits zerstoertes Tk-Fenster - dieser (daemon-)Thread
-            # wird dadurch nicht selbst zum Problem (der zugrunde liegende
-            # FFmpeg-Testlauf ist ueber sein eigenes subprocess.run(timeout=...)
-            # ohnehin spaetestens nach ~10s garantiert beendet), aber ohne
-            # dieses try/except wuerde eine Exception im Hintergrund-Thread
-            # als Traceback auf stderr landen.
-            try:
-                self.after(0, self._apply_encoder_check, encoder, available, fallback_msg, success_text)
-            except Exception:
-                pass
+            # Falls die App inzwischen geschlossen wird/wurde, verwirft
+            # _post_to_gui das Ergebnis bzw. schluckt den Fehler am bereits
+            # zerstoerten Fenster (der FFmpeg-Testlauf selbst endet ueber
+            # sein eigenes subprocess.run(timeout=...) spaetestens nach ~10s).
+            self._post_to_gui(self._apply_encoder_check, encoder, available,
+                              fallback_msg, success_text)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1121,6 +1162,8 @@ class MainWindow(ctk.CTk):
         # ein zweiter Klick waehrend eine Optimierung schon laeuft wuerde
         # sonst einen zweiten, konkurrierenden FFmpeg-Prozess auf dieselbe
         # Ausgabedatei starten.
+        if self._closing:
+            return
         if self._optimize_thread is not None and self._optimize_thread.is_alive():
             return
 
@@ -1144,9 +1187,9 @@ class MainWindow(ctk.CTk):
 
         self._optimize_thread = OptimizeThread(
             self._optimize_input_path, output_path, profile,
-            on_progress=lambda p: self.after(0, self._on_optimize_progress, p),
-            on_finish=lambda out, orig, new: self.after(0, self._on_optimize_finish, out, orig, new),
-            on_error=lambda m: self.after(0, self._on_optimize_error, m),
+            on_progress=lambda p: self._post_to_gui(self._on_optimize_progress, p),
+            on_finish=lambda out, orig, new: self._post_to_gui(self._on_optimize_finish, out, orig, new),
+            on_error=lambda m: self._post_to_gui(self._on_optimize_error, m),
         )
         self._optimize_thread.start()
 
@@ -1164,6 +1207,8 @@ class MainWindow(ctk.CTk):
         self.after(200, self._poll_optimize_cancelled)
 
     def _poll_optimize_cancelled(self):
+        if self._closing:
+            return
         if self._optimize_thread and self._optimize_thread.is_alive():
             self.after(200, self._poll_optimize_cancelled)
             return
@@ -1214,6 +1259,8 @@ class MainWindow(ctk.CTk):
     # BENCHMARK
     # ==================================================================
     def _start_benchmark(self):
+        if self._closing:
+            return
         self.bench_btn.configure(state="disabled", text="⏳  Test läuft ...")
         self.start_btn.configure(state="disabled")
         self.bench_status.configure(
@@ -1221,9 +1268,9 @@ class MainWindow(ctk.CTk):
         )
 
         self.benchmark_thread = BenchmarkThread(
-            on_progress=lambda t: self.after(0, self._bench_progress, t),
-            on_finish=lambda r: self.after(0, self._bench_finish, r),
-            on_error=lambda m: self.after(0, self._bench_error, m),
+            on_progress=lambda t: self._post_to_gui(self._bench_progress, t),
+            on_finish=lambda r: self._post_to_gui(self._bench_finish, r),
+            on_error=lambda m: self._post_to_gui(self._bench_error, m),
             screen_size=self._current_screen_size(),
         )
         self.benchmark_thread.start()
@@ -1266,6 +1313,8 @@ class MainWindow(ctk.CTk):
         # kommt asynchron erst nach dem Prozessstart), einen zweiten,
         # verwaisten RecorderThread/FFmpeg-Prozess samt zweitem MiniPanel
         # erzeugen. self.recorder ist nur zwischen Start und Stop gesetzt.
+        if self._closing:
+            return
         if self.recorder is not None:
             return
 
@@ -1328,6 +1377,8 @@ class MainWindow(ctk.CTk):
         # eine fehlende Audiospur in der fertigen Datei ein Befund und
         # keine voellig normale Bild-ohne-Ton-Aufnahme.
         self._recording_had_audio = bool(settings.get("audio_device")) or audio_only
+        # Quelltyp fuer Diagnose und Stille-Hinweis (Mikrofon/Systemton/unbekannt)
+        self._recording_source_kind = recording_source_kind(audio_label, self.audio_map)
 
         # Gewaehlte Einstellungen (v. a. die Tonquelle) fuer den naechsten
         # Programmstart merken.
@@ -1339,15 +1390,17 @@ class MainWindow(ctk.CTk):
 
         self.recorder = RecorderThread(
             settings,
-            on_started=lambda: self.after(0, self._on_recording_started),
-            on_stopped=lambda p, s: self.after(0, self._on_recording_stopped, p, s),
-            on_error=lambda m: self.after(0, self._on_recording_error, m),
+            on_started=lambda: self._post_to_gui(self._on_recording_started),
+            on_stopped=lambda p, s: self._post_to_gui(self._on_recording_stopped, p, s),
+            on_error=lambda m: self._post_to_gui(self._on_recording_error, m),
         )
         self.recorder.start()
 
         self._set_status("Aufnahme wird gestartet ...", COLOR_ACCENT)
 
     def _on_recording_started(self):
+        if self._closing:
+            return  # kein MiniPanel, kein Timer im Zustand "schließt"
         # Hauptfenster ausblenden -> spart RAM/CPU auf schwacher Hardware
         self.withdraw()
 
@@ -1365,7 +1418,7 @@ class MainWindow(ctk.CTk):
 
     def _tick_timer(self):
         """Aktualisiert Timer + Blinkpunkt im Sekundentakt."""
-        if not (self.recorder and self.mini_panel):
+        if self._closing or not (self.recorder and self.mini_panel):
             return
 
         try:
@@ -1379,32 +1432,51 @@ class MainWindow(ctk.CTk):
         self._timer_job = self.after(500, self._tick_timer)
 
     def _toggle_pause(self) -> bool:
-        return self.recorder.toggle_pause() if self.recorder else False
+        rec = self.recorder
+        if self._closing:
+            # Zustand bleibt unverändert - nur den aktuellen melden.
+            return bool(rec.is_paused) if rec else False
+        return rec.toggle_pause() if rec else False
 
     def _stop_recording(self):
+        if self._closing:
+            return
         if self._timer_job:
-            self.after_cancel(self._timer_job)
+            try:
+                self.after_cancel(self._timer_job)
+            except Exception:
+                pass
             self._timer_job = None
-        if self.recorder:
-            self.recorder.stop()
+        rec = self.recorder
+        if rec:
+            rec.stop()
 
     def _on_recording_stopped(self, path: str, success: bool):
+        if self._closing:
+            return  # kein Dialog, kein deiconify im Zustand "schließt"
+        rec = self.recorder
         # Vor dem Zuruecksetzen sichern - wird gebraucht, um eine evtl.
         # vorzeitig abgeschnittene Aufnahme zu erkennen (siehe
-        # _check_recording_truncated) UND um im Fehlerfall die rohe
+        # DiagnosisThread) UND um im Fehlerfall die rohe
         # FFmpeg-Ausgabe in eine Log-Datei schreiben zu koennen, statt
         # sie nur (gekuerzt) in einer Dialogbox zu zeigen, die leicht
         # weggeklickt wird, bevor jemand den Text kopieren kann.
-        elapsed = self.recorder.get_elapsed() if self.recorder else 0.0
-        stderr_lines = list(self.recorder._stderr_buffer) if self.recorder else []
-        command = list(self.recorder.command) if self.recorder else []
+        # Eingefrorene Erfassungsdauer - die Finalisierungszeit nach dem
+        # Stoppen zaehlt bewusst NICHT mit (sonst falscher Abschneide-Verdacht).
+        elapsed = rec.get_capture_seconds() if rec else 0.0
+        stderr_lines = list(rec._stderr_buffer) if rec else []
+        command = list(rec.command) if rec else []
         # Angeforderte Bildrate merken - nur im Vergleich dazu laesst sich
         # sagen, ob die Aufnahme wirklich mitgekommen ist (siehe
         # _check_recording_fps).
         try:
-            requested_fps = float(self.recorder.settings.get("fps", 0)) if self.recorder else 0.0
+            requested_fps = float(rec.settings.get("fps", 0)) if rec else 0.0
         except (TypeError, ValueError):
             requested_fps = 0.0
+        try:
+            audio_offset_ms = int(rec.settings.get("audio_offset_ms", 0) or 0) if rec else 0
+        except (TypeError, ValueError):
+            audio_offset_ms = 0
 
         if self.mini_panel:
             try:
@@ -1438,11 +1510,8 @@ class MainWindow(ctk.CTk):
             # Video-Encoder) verarbeiten könnten.
             if not self._active_audio_only:
                 self._set_optimize_file(path)
-            threading.Thread(
-                target=self._check_recording_truncated,
-                args=(path, elapsed, log_path, requested_fps, self._recording_had_audio),
-                daemon=True,
-            ).start()
+            self._start_diagnosis(path, elapsed, log_path, requested_fps,
+                                  self._recording_had_audio, audio_offset_ms)
             if messagebox.askyesno(
                 "Aufnahme fertig",
                 f"Datei gespeichert:\n{os.path.basename(path)}  ({size_mb:.1f} MB)\n\n"
@@ -1456,87 +1525,55 @@ class MainWindow(ctk.CTk):
                 COLOR_DANGER,
             )
 
-    def _check_recording_truncated(self, path: str, elapsed_seconds: float,
-                                   log_path: str | None, requested_fps: float = 0.0,
-                                   had_audio: bool = False):
+    def _start_diagnosis(self, path: str, capture_seconds: float, log_path: str | None,
+                         requested_fps: float = 0.0, had_audio: bool = False,
+                         audio_offset_ms: int = 0):
         """
-        Läuft im Hintergrund (Dateidauer-Sondierung kann kurz dauern) und
-        vergleicht die tatsächlich vergangene Aufnahmezeit mit der Dauer
-        der fertigen Datei.
+        Startet die nachträgliche Prüfung der fertigen Aufnahme im
+        Hintergrund (siehe diagnosis.DiagnosisThread): Dauer, Streams,
+        Bildrate, Stille und Spur-Enden - verglichen mit der EINGEFRORENEN
+        Erfassungsdauer, nicht mit der Zeit bis zum Ende der Finalisierung.
 
         Hintergrund: ein Aussetzer der Audioaufnahme (z. B. Puffer-
         Überlauf beim Mikrofon) kann FFmpeg dazu bringen, den Audio-Input
         vorzeitig zu beenden - das passiert mit sauberem Exit-Code, wird
-        also von RecorderThread NICHT als Fehler erkannt und bislang auch
-        nicht dem Nutzer gemeldet. Ergebnis: eine "erfolgreich" gemeldete,
-        aber nur wenige Sekunden/KB große Datei. Diese Prüfung holt das
-        nachträglich sichtbar nach.
+        also von RecorderThread NICHT als Fehler erkannt. Diese Prüfung
+        holt das nachträglich sichtbar nach. Im Zustand "schließt" wird
+        sie nicht gestartet; beim Schließen bricht _on_close sie ab.
         """
-        if elapsed_seconds < 4:
-            return  # zu kurz fuer eine verlaessliche Aussage
-        try:
-            duration = probe_duration_seconds(path)
-        except Exception:
-            duration = None
-
-        if duration is None:
-            # Die Dauer liess sich nicht einmal auslesen - genau der Fall
-            # "Datei laesst sich gar nicht abspielen".
-            self._append_recording_log(
-                log_path,
-                f"BEFUND: Aufnahme lief {elapsed_seconds:.0f}s, aber die Dauer der "
-                "Datei ist nicht auslesbar - Datei vermutlich beschaedigt/unvollstaendig.",
-            )
-            self.after(0, self._warn_unreadable_file, log_path)
+        if self._closing:
             return
-
-        self._append_recording_log(
-            log_path, f"Dauer laut Datei: {duration:.1f}s (Aufnahmezeit: {elapsed_seconds:.1f}s)"
+        source_kind = self._recording_source_kind
+        self._diagnosis_thread = DiagnosisThread(
+            path,
+            capture_seconds=capture_seconds,
+            requested_fps=requested_fps,
+            had_audio=had_audio,
+            audio_only=self._active_audio_only,
+            audio_offset_ms=audio_offset_ms,
+            source_kind=source_kind,
+            # Protokoll direkt (reine Datei-Ein-/Ausgabe, kein Tkinter)
+            log=lambda text: self._append_recording_log(log_path, text),
+            warn=lambda kind, *details: self._on_diagnosis_warning(kind, log_path, *details),
         )
+        self._diagnosis_thread.start()
 
-        # Streams der fertigen Datei protokollieren. Die Containerdauer
-        # allein verraet NICHT, ob die Tonspur vorhanden ist oder
-        # vorzeitig endet - "Datei volle Laenge, aber Ton nur kurz" sieht
-        # an der Gesamtdauer voellig unauffaellig aus.
-        info = probe_media_info(path)
-        self._append_recording_log(log_path, "Inhalt der Datei laut FFmpeg:\n" + info)
-
-        self._check_recording_fps(info, requested_fps, log_path)
-
-        if "Audio:" not in info:
-            # Es wurde eine Tonquelle gewaehlt, aber es gibt gar keinen
-            # Audiostream - das ist ein eindeutiger Befund, kein Verdacht.
-            if had_audio:
-                self._append_recording_log(
-                    log_path,
-                    "BEFUND: Es war eine Tonquelle ausgewaehlt, die Datei enthaelt "
-                    "aber ueberhaupt keinen Audiostream.",
-                )
-                self.after(0, self._warn_no_audio_stream, log_path)
-        elif had_audio:
-            # Tonspur vorhanden - aber ist darauf auch etwas zu hoeren?
-            # (siehe optimizer.probe_max_volume_db)
-            max_db = probe_max_volume_db(path)
-            if max_db is not None:
-                self._append_recording_log(
-                    log_path, f"Tonpegel: lautester Moment {max_db:.1f} dB"
-                )
-                if max_db <= SILENT_AUDIO_MAX_DB:
-                    self._append_recording_log(
-                        log_path,
-                        "BEFUND: Die Tonspur ist vorhanden, enthaelt aber nur "
-                        "Stille (Mikrofonzugriff gesperrt, Geraet stumm oder "
-                        "falsches Geraet gewaehlt).",
-                    )
-                    self.after(0, self._warn_silent_audio, log_path)
-
-        if duration < elapsed_seconds * 0.7 - 1.0:
-            self._append_recording_log(
-                log_path,
-                f"BEFUND: Datei deutlich kuerzer als die Aufnahmezeit "
-                f"({duration:.0f}s statt {elapsed_seconds:.0f}s) - vorzeitig abgeschnitten.",
-            )
-            self.after(0, self._warn_possible_truncation, elapsed_seconds, duration, log_path)
+    def _on_diagnosis_warning(self, kind: str, log_path: str | None, *details):
+        """Läuft im DiagnosisThread: Befund über _post_to_gui an den passenden Dialog."""
+        if kind == "unreadable":
+            self._post_to_gui(self._warn_unreadable_file, log_path)
+        elif kind == "no_audio":
+            self._post_to_gui(self._warn_no_audio_stream, log_path)
+        elif kind == "silent":
+            source_kind = details[0] if details else self._recording_source_kind
+            self._post_to_gui(self._warn_silent_audio, log_path, source_kind)
+        elif kind == "truncation":
+            capture, duration = details[:2]
+            self._post_to_gui(self._warn_possible_truncation, capture, duration, log_path)
+        elif kind == "track_short":
+            capture, duration, warnings, truncated = details[:4]
+            self._post_to_gui(self._warn_track_too_short, capture, duration,
+                              warnings, truncated, log_path)
 
     def _write_recording_log(self, video_path: str, stderr_lines: list, command: list,
                              elapsed_seconds: float, success: bool) -> str | None:
@@ -1589,17 +1626,9 @@ class MainWindow(ctk.CTk):
         Container eingetragene Sollrate. Genau diese Verwechslung
         verschleiert das Problem: eine Datei kann "60 tbr" tragen und
         trotzdem nur 9 Bilder pro Sekunde enthalten.
+        (Implementierung GUI-frei in diagnosis.parse_achieved_fps.)
         """
-        for line in media_info.splitlines():
-            if "Video:" not in line:
-                continue
-            match = re.search(r"(\d+(?:\.\d+)?)\s+fps", line)
-            if match:
-                try:
-                    return float(match.group(1))
-                except ValueError:
-                    return None
-        return None
+        return parse_achieved_fps(media_info)
 
     def _check_recording_fps(self, media_info: str, requested_fps: float,
                              log_path: str | None):
@@ -1621,23 +1650,11 @@ class MainWindow(ctk.CTk):
         Eine Warnung würde nach jeder ruhigen Aufnahme fälschlich
         anschlagen; deshalb steht der Wert nur im Protokoll, wo er beim
         Nachforschen hilft, ohne im Normalbetrieb zu stören.
+        (Die Diagnose nutzt dieselbe Funktion diagnosis.fps_log_line.)
         """
-        if requested_fps <= 0:
-            return
-        achieved = self.parse_achieved_fps(media_info)
-        if achieved is None:
-            return
-
-        ratio = achieved / requested_fps
-        note = ""
-        if ratio < 0.7:
-            note = ("  (deutlich unter dem Sollwert - entweder ruhiger "
-                    "Bildschirминhalt oder der Encoder kam nicht mit)")
-        self._append_recording_log(
-            log_path,
-            f"Bildrate: {achieved:.1f} von {requested_fps:.0f} fps erreicht "
-            f"({ratio * 100:.0f} %){note}",
-        )
+        line = fps_log_line(media_info, requested_fps)
+        if line:
+            self._append_recording_log(log_path, line)
 
     @staticmethod
     def _capture_method_from(command: list) -> str:
@@ -1689,29 +1706,15 @@ class MainWindow(ctk.CTk):
             f"{log_hint}",
         )
 
-    def _warn_silent_audio(self, log_path: str | None):
+    def _warn_silent_audio(self, log_path: str | None, source_kind: str | None = None):
         self._set_status("⚠ Tonspur ist stumm", COLOR_WARNING)
         log_hint = (
             f"\n\nDetails im Protokoll:\n{os.path.basename(log_path)}"
             if log_path else ""
         )
-        if IS_WINDOWS:
-            causes = (
-                "• Windows sperrt den Mikrofonzugriff: Einstellungen → "
-                "Datenschutz und Sicherheit → Mikrofon → \"Desktop-Apps den "
-                "Zugriff auf das Mikrofon erlauben\" einschalten.\n"
-                "• Das Mikrofon ist stummgeschaltet (Taste am Headset/Notebook "
-                "oder in der Sound-Systemsteuerung).\n"
-                "• Es ist das falsche Gerät gewählt. Den Ton vom PC selbst "
-                "(Videos, Spiele) nimmt ein Mikrofon-Eingang nicht auf – dafür "
-                "braucht es \"Stereomix\" o. Ä."
-            )
-        else:
-            causes = (
-                "• Das Mikrofon ist stummgeschaltet (pavucontrol / Systemeinstellungen).\n"
-                "• Es ist das falsche Gerät gewählt – für den Ton vom PC selbst "
-                "die \"Systemton\"-Quelle (Monitor) wählen."
-            )
+        # Hinweise abhängig vom Quelltyp (Mikrofon/Systemton/unbekannt),
+        # siehe diagnosis.silent_audio_hint.
+        causes = silent_audio_hint(source_kind or self._recording_source_kind, IS_WINDOWS)
         messagebox.showwarning(
             "Tonspur ist stumm",
             "Die Aufnahme hat zwar eine Tonspur, darauf ist aber nichts zu hören.\n\n"
@@ -1754,6 +1757,30 @@ class MainWindow(ctk.CTk):
             f"{log_hint}",
         )
 
+    def _warn_track_too_short(self, capture_seconds: float, duration: float,
+                              warnings: list, truncated: bool, log_path: str | None):
+        """
+        EIN Dialog für vorzeitig endende Spuren - ist zusätzlich der Container
+        verdächtig kurz, steht das in derselben Meldung (kein zweiter Dialog).
+        """
+        self._set_status("⚠ Eine Spur der Aufnahme endet vorzeitig", COLOR_WARNING)
+        log_hint = (
+            f"\n\nDetails wurden gespeichert in:\n{os.path.basename(log_path)}"
+            if log_path else ""
+        )
+        text = "\n".join(f"• {w}" for w in warnings)
+        if truncated:
+            text += (f"\n• Auch die Datei selbst ist deutlich kürzer: {duration:.0f} s "
+                     f"statt {capture_seconds:.0f} s.")
+        messagebox.showwarning(
+            "Aufnahme möglicherweise unvollständig",
+            "Die Aufnahme wurde gespeichert, aber nicht alle Spuren reichen bis "
+            "zum Ende:\n\n" + text + "\n\n"
+            "Das deutet auf einen Aussetzer der Ton- oder Bildaufnahme hin "
+            "(z. B. ein kurzzeitiger Puffer-Überlauf des Audiogeräts)."
+            f"{log_hint}",
+        )
+
     def _on_recording_error(self, message: str):
         # Das Protokoll schreibt _on_recording_stopped, das unmittelbar
         # nach diesem Callback ohnehin immer laeuft (auch im Fehlerfall) -
@@ -1769,7 +1796,7 @@ class MainWindow(ctk.CTk):
               "(…_aufnahme-log.txt).",
         )
 
-    def _wait_for_recorder_shutdown(self):
+    def _wait_for_recorder_shutdown(self, rec=None):
         """
         Wartet auf das Ende von RecorderThread, OHNE dabei die komplette
         Tk-Ereignisschleife zu blockieren wie ein einzelnes langes join()
@@ -1787,7 +1814,15 @@ class MainWindow(ctk.CTk):
         hier stattdessen in kleinen Schritten warten und zwischendurch
         self.update() aufrufen, WAEHREND eine Statuszeile anzeigt, dass
         bewusst noch (kurz) gewartet wird.
+
+        Arbeitet mit einer LOKALEN Recorder-Referenz: ein waehrend des
+        pumpenden Wartens ausgefuehrter Callback darf self.recorder auf
+        None setzen, ohne dass hier ein AttributeError entsteht.
         """
+        if rec is None:
+            rec = self.recorder
+        if rec is None:
+            return
         self._set_status("Aufnahme wird finalisiert – bitte warten ...", COLOR_ACCENT)
         try:
             self.update()
@@ -1797,47 +1832,194 @@ class MainWindow(ctk.CTk):
         # Der Thread entscheidet selbst, wann FFmpeg haengt - hier nur eine
         # Sicherung oberhalb seiner eigenen Obergrenze.
         deadline = time.time() + FINALIZE_MAX_SECONDS + 15
-        while self.recorder.is_alive() and time.time() < deadline:
-            self.recorder.join(timeout=0.2)
+        while rec.is_alive() and time.time() < deadline:
+            rec.join(timeout=0.2)
             try:
                 self.update()
             except Exception:
                 # Fenster wurde zwischenzeitlich zerstoert - nichts mehr zu tun.
                 break
 
-        if self.recorder.is_alive():
+        if rec.is_alive():
             # Letzte Instanz: sollte selbst dann nichts geklappt haben
             # (haengender Thread), FFmpeg hart beenden statt die App ewig
             # offenzuhalten oder als Waisenprozess weiterlaufen zu lassen.
-            self.recorder.force_kill()
-            self.recorder.join(timeout=3)
+            log_stderr("Aufnahme nach Ablauf der Finalisierungsfrist hart beendet.")
+            rec.force_kill()
+            rec.join(timeout=3)
 
     # ==================================================================
+    # SCHLIESSEN
+    # ==================================================================
     def _on_close(self):
-        if self.recorder and self.recorder.is_active:
-            if not messagebox.askyesno(
-                "Aufnahme läuft",
-                "Es läuft noch eine Aufnahme. Wirklich beenden?"
-            ):
+        """
+        Schließen des Hauptfensters.
+
+        Läuft eine Aufnahme (lebender RecorderThread - auch in der
+        Startphase, bevor FFmpeg steht), entscheidet der Nutzer:
+          Ja        -> sauber stoppen und speichern, dann schließen
+          Nein      -> FFmpeg sofort beenden, Datei löschen, schließen
+          Abbrechen -> nichts ändern, Aufnahme läuft weiter
+        Der Zustand "schließt" (self._closing) wird erst nach Ja/Nein gesetzt.
+        """
+        if self._closing or self._close_dialog_open:
+            return  # Rückfrage offen oder Schließen läuft schon: No-op
+
+        rec = self.recorder
+        if recording_running(rec):
+            self._close_dialog_open = True
+            try:
+                answer = messagebox.askyesnocancel(
+                    "Aufnahme läuft",
+                    "Es läuft noch eine Aufnahme. Aufnahme speichern?",
+                )
+            finally:
+                self._close_dialog_open = False
+
+            choice = close_choice(answer)
+            if choice == CLOSE_CANCEL:
+                return  # Aufnahme läuft unverändert weiter
+
+            if choice == CLOSE_SAVE:
+                self._begin_closing("Aufnahme wird gespeichert …")
+                try:
+                    rec.stop()
+                    # Bestehendes Verhalten: aktivitätsbasierte Finalisierung
+                    # bis FINALIZE_MAX_SECONDS + 15 s, danach force_kill.
+                    self._wait_for_recorder_shutdown(rec)
+                    self._write_closing_log(rec)
+                finally:
+                    self._finish_close(wait_recorder=False)
                 return
-            self.recorder.stop()
-            self._wait_for_recorder_shutdown()
 
-        self._save_settings()
+            # Nein: verwerfen - keine Finalisierungswartezeit, kein Dialog.
+            self._begin_closing("Aufnahme wird verworfen …")
+            try:
+                self._discard_recording(rec)
+            finally:
+                self._finish_close(wait_recorder=False)
+            return
 
-        if self._meter_poll_job:
-            self.after_cancel(self._meter_poll_job)
-            self._meter_poll_job = None
-        self._pause_meters()
+        # Keine laufende Aufnahme: ohne Rückfrage schließen.
+        self._begin_closing("Wird beendet …")
+        self._finish_close(wait_recorder=True)
 
-        if self.benchmark_thread and self.benchmark_thread.is_alive():
-            self.benchmark_thread.cancel()
+    def _begin_closing(self, overlay_text: str):
+        """
+        Zustand "schließt" setzen: ab hier keine Dialoge, keine neuen Threads,
+        keine neuen after-Schleifen. Laufende after-Jobs werden abbestellt,
+        das MiniPanel reagiert nicht mehr auf Pause/Leertaste, und ein modales
+        Sperr-Overlay (grab_set) fängt alle Klicks und Tasten ab, solange
+        gepumpt gewartet wird.
+        """
+        self._closing = True
 
-        if self._optimize_thread and self._optimize_thread.is_alive():
+        for job in (self._timer_job, self._meter_poll_job, self._region_job):
+            if job:
+                try:
+                    self.after_cancel(job)
+                except Exception:
+                    pass
+        self._timer_job = None
+        self._meter_poll_job = None
+        self._region_job = None
+
+        panel = self.mini_panel
+        if panel is not None:
+            try:
+                panel.unbind("<space>")
+            except Exception:
+                pass
+            panel.on_pause = None
+
+        self._show_close_overlay(overlay_text)
+
+    def _show_close_overlay(self, text: str):
+        """Modales Sperr-Overlay; Fehler (z. B. Fenster nicht sichtbar) werden geschluckt."""
+        try:
+            overlay = ctk.CTkToplevel(self)
+            overlay.title(APP_NAME)
+            overlay.geometry("380x110")
+            overlay.resizable(False, False)
+            overlay.protocol("WM_DELETE_WINDOW", lambda: None)
+            try:
+                overlay.attributes("-topmost", True)
+            except Exception:
+                pass
+            ctk.CTkLabel(
+                overlay, text=text, font=("Segoe UI", 14),
+                text_color=COLOR_TEXT_PRIMARY,
+            ).pack(expand=True, fill="both", padx=20, pady=20)
+            self._close_overlay = overlay
+            overlay.update()
+            overlay.grab_set()
+        except Exception:
+            pass
+
+    def _discard_recording(self, rec):
+        """
+        Nein-Pfad: Reihenfolge ist wichtig (auch in der Startphase):
+        1) stop() setzt das Abbruch-Flag unter dem Worker-Lock - danach
+           startet der Thread keinen FFmpeg-Prozess mehr;
+        2) force_kill() beendet einen bereits gestarteten Prozess sofort;
+        3) in der Startphase (noch kein FFmpeg-Prozess, z. B. ddagrab-
+           Prüfung) wird kurz auf das Ende der Vorprüfung gewartet, damit
+           deren Kindprozess nicht verwaist (SRP1-IR-02);
+        4) die unfertige Ausgabedatei wird gelöscht.
+        """
+        path = getattr(rec, "output_path", "") or ""
+        rec.stop()
+        rec.force_kill()
+        wait_for_recorder_startup(rec, pump=self._pump_events)
+        remove_partial_output(path)
+        log_stderr(f"Aufnahme beim Schließen verworfen: {path or '(ohne Datei)'}")
+
+    def _write_closing_log(self, rec):
+        """Aufnahmeprotokoll nach dem Ja-Pfad (der normale Stopp-Callback entfällt)."""
+        try:
+            self._write_recording_log(
+                rec.output_path, list(rec._stderr_buffer), list(rec.command),
+                rec.get_capture_seconds(), bool(rec.success),
+            )
+        except Exception:
+            pass
+
+    def _pump_events(self):
+        try:
+            self.update()
+        except Exception:
+            pass
+
+    def _finish_close(self, wait_recorder: bool = True):
+        """
+        Gemeinsamer Abschluss aller Schließwege: ggf. lebenden Recorder
+        sauber stoppen, Einstellungen sichern, Vorschau freigeben,
+        Optimierung/Leistungstest/Diagnose abbrechen (zusammen höchstens
+        10 s, danach hart) und das Fenster IMMER zerstören.
+        """
+        try:
+            rec = self.recorder
+            if wait_recorder and recording_running(rec):
+                # Schließweg ohne Rückfrage, aber mit lebendem RecorderThread
+                rec.stop()
+                self._wait_for_recorder_shutdown(rec)
+
+            self._save_settings()
+            try:
+                self._pause_meters()
+            except Exception:
+                pass
+
             # Kein Datenverlust-Risiko wie bei einer laufenden Aufnahme (die
-            # Originaldatei bleibt so oder so unangetastet) - deshalb ohne
-            # Rückfrage einfach abbrechen; die unfertige Ausgabedatei räumt
-            # OptimizeThread.cancel() selbst auf.
-            self._optimize_thread.cancel()
-
-        self.destroy()
+            # Originaldatei bleibt unangetastet) - deshalb ohne Rückfrage
+            # abbrechen; die unfertige Ausgabedatei räumt OptimizeThread
+            # selbst auf.
+            wait_for_workers(
+                [self.benchmark_thread, self._optimize_thread, self._diagnosis_thread],
+                pump=self._pump_events,
+            )
+        finally:
+            try:
+                self.destroy()
+            except Exception:
+                pass

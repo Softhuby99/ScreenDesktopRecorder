@@ -68,6 +68,8 @@ class BenchmarkThread(threading.Thread):
         self._screen_size = screen_size
         self._process: subprocess.Popen | None = None
         self._cancelled = threading.Event()
+        # Schützt Abbruch-Flag und Prozessveröffentlichung (siehe cancel)
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     def _emit(self, callback, *args):
@@ -79,13 +81,23 @@ class BenchmarkThread(threading.Thread):
                 pass
 
     def cancel(self):
-        """Bricht den laufenden Benchmark ab (z. B. beim Schließen der App)."""
-        self._cancelled.set()
-        if self._process and self._process.poll() is None:
+        """
+        Bricht den laufenden Benchmark ab (z. B. beim Schließen der App).
+        Wirkt in jedem Zustand, auch gleichzeitig zum Start eines Messlaufs.
+        """
+        with self._lock:
+            self._cancelled.set()
+            process = self._process
+        if process is not None:
             try:
-                self._process.kill()
+                if process.poll() is None:
+                    process.kill()
             except Exception:
                 pass
+
+    def kill(self):
+        """Hart beenden (nach Ablauf des Wartebudgets beim Schließen)."""
+        self.cancel()
 
     # ------------------------------------------------------------------
     def run(self):
@@ -237,17 +249,19 @@ class BenchmarkThread(threading.Thread):
         NACH der Anlaufphase berechnet - Prozessstart und das Füllen des
         Encoder-Lookaheads würden das Ergebnis sonst nach unten verzerren.
         """
-        if self._cancelled.is_set():
-            raise InterruptedError("Benchmark abgebrochen.")
-
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            **get_subprocess_flags(),
-        )
-        process = self._process
+        # Flag-Prüfung, Start und Veröffentlichung unter EINEM Lock: ein
+        # paralleles cancel() sieht danach den Prozess und beendet ihn.
+        with self._lock:
+            if self._cancelled.is_set():
+                raise InterruptedError("Benchmark abgebrochen.")
+            self._process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **get_subprocess_flags(),
+            )
+            process = self._process
 
         points: list[tuple[float, int]] = []   # (Zeitpunkt, kodierte Bilder)
         stderr_lines: list[str] = []
@@ -312,6 +326,9 @@ class BenchmarkThread(threading.Thread):
         for t in readers:
             t.join(timeout=2)
 
+        if self._cancelled.is_set():
+            # Von cancel() getöteter Prozess ist kein Fehler.
+            raise InterruptedError("Benchmark abgebrochen.")
         if exited_early and process.returncode not in (0, None) and len(points) < 2:
             raise RuntimeError(
                 "\n".join(stderr_lines[-5:])
@@ -340,17 +357,19 @@ class BenchmarkThread(threading.Thread):
     # ------------------------------------------------------------------
     def _terminate_process(self):
         """Beendet FFmpeg zuerst freundlich ('q'), danach hart."""
-        if not self._process or self._process.poll() is not None:
+        with self._lock:
+            process = self._process
+        if not process or process.poll() is not None:
             return
         try:
-            if self._process.stdin:
-                self._process.stdin.write(b"q")
-                self._process.stdin.flush()
-                self._process.stdin.close()
-            self._process.wait(timeout=3)
+            if process.stdin:
+                process.stdin.write(b"q")
+                process.stdin.flush()
+                process.stdin.close()
+            process.wait(timeout=3)
         except Exception:
             try:
-                self._process.kill()
-                self._process.wait(timeout=2)
+                process.kill()
+                process.wait(timeout=2)
             except Exception:
                 pass

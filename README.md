@@ -5,8 +5,18 @@ optimiert für flüssige Aufnahmen auch auf älteren/schwächeren Notebooks.
 
 ## Fertige Builds herunterladen (automatisch gebaut)
 
-Bei jedem Push auf `main` baut eine GitHub Action automatisch zwei
-eigenständige Programme auf echten Runnern der jeweiligen Plattform:
+**Gilt nur im Ursprungs-Repo ScreenDesktopRecorder.** Die Workflow-Datei
+liegt bewusst unter `projects/ScreenRecPro/.github/workflows/build.yml`:
+Im Ursprungs-Repo ist dieser Projektordner das Checkout-Root, dort ist sie
+eine gültige GitHub Action. Im Claudex-Repo liegt sie nicht im
+Repo-Root-`.github/` und läuft deshalb absichtlich **nicht** - hier gibt es
+keine automatischen Builds. Der folgende Ablauf beschreibt das
+Ursprungs-Repo; im Windows-Build ist nur `bin\ffmpeg.exe` gebündelt (kein
+ffprobe).
+
+Bei jedem Push auf `main` (im Ursprungs-Repo) baut die GitHub Action
+automatisch zwei eigenständige Programme auf echten Runnern der jeweiligen
+Plattform:
 
 - **Windows:** `ScreenRecPro.exe` (inkl. eingebettetem FFmpeg, läuft ohne
   weitere Installation)
@@ -62,6 +72,10 @@ installiert alle Abhängigkeiten sowie PyInstaller und baut
 | `platform_utils.py` | Betriebssystem-Abstraktion (Windows/Linux/macOS) |
 | `config.py` | Zentrale Konstanten (Farben, Encoding-Presets, Benchmark-Matrix) |
 | `optimizer.py` | Nachträgliche Verkleinerung fertiger Videodateien (Thread) |
+| `diagnosis.py` | Abbrechbare Nachprüfung fertiger Aufnahmen (Dauer, Stille, Spur-Enden) |
+| `recording_validation.py` | Pflichtspur- und Spur-Endeprüfung mit FFmpeg (ohne ffprobe) |
+| `gui_logic.py` | GUI-freie Entscheidungslogik des Hauptfensters (Schließen, Quelltyp) |
+| `tools/` | Historische Diagnose-Skripte (keine Tests), Windows-Diagnose, Sync-Werkzeuge |
 | `settings_store.py` | Merkt sich Tonquelle, Speicherort, FPS, Encoder und Preset zwischen zwei Starts (`%APPDATA%\ScreenRecPro\settings.json` bzw. `~/.config/ScreenRecPro/settings.json`) |
 
 ## Video- und Audio-Tab
@@ -86,17 +100,92 @@ Gerät, das auch aufgenommen wird. Ist die Tonspur einer fertigen
 Aufnahme komplett stumm (z. B. weil Windows den Mikrofonzugriff für
 Desktop-Apps sperrt), warnt die App mit den möglichen Ursachen.
 
-**Ton und Bild synchron:** Unter Windows bekommen Ton (DirectShow) und
-Bild (ddagrab) eine gemeinsame Uhr. Früher setzte FFmpeg jede Quelle für
-sich auf 0 - da die Bildquelle einige hundert ms später startet als die
-Tonquelle, kam der Ton um genau diese (schwankende) Startverzögerung zu
-spät. Für Geräte mit eigener Verzögerung (z. B. Bluetooth-Headsets) gibt
-es im Audio-Tab zusätzlich den Regler **Ton-Versatz** (±500 ms).
+**Ton/Bild-Zeitstempel:** Die Aufnahme verwendet die nativen Zeitstempel
+(Basis der erfolgreichen Testvariante B02). Die fehlerhafte Wallclock-/copyts-
+Kombination und die heuristische Verwerfung/Verschiebung von Audiobloecken
+wurden entfernt. Ein verbleibender Start-/Geraeteversatz ist damit noch nicht
+automatisch korrigiert. Im Audio-Tab steht dafuer **Ton-Versatz** (±500 ms)
+zur Verfuegung: negativ = Ton frueher, positiv = Ton spaeter.
 
-**Ton vom PC selbst (Systemton) unter Windows:** FFmpeg kann unter
-Windows nur Aufnahmegeräte (DirectShow) öffnen. Der Ton, der aus den
-Lautsprechern kommt, ist nur aufnehmbar, wenn ein Gerät wie "Stereomix"
-vorhanden und aktiviert ist - viele neuere Notebooks haben das nicht.
+**Aufnahmepruefung:** Nach dem Stoppen prueft FFmpeg die angeforderten Spuren
+und dekodiert den Anfang. Fehlende Spuren, unlesbare Dateien und bekannte
+schwere Aufnahmefehler werden auch bei Exitcode 0 als Fehler gemeldet.
+Diese kurze Pruefung garantiert weder eine fehlerfreie gesamte Datei noch
+inhaltliche Synchronitaet. Danach prueft die Diagnose im Hintergrund, ob eine
+erwartete Spur deutlich vor dem Ende der Erfassungsdauer endet (Toleranz 2 s
+plus Ton-Versatz); das wird protokolliert und als Warnung gezeigt, macht die
+Aufnahme aber nicht ungueltig.
+
+**Schliessen waehrend einer Aufnahme:** Die App fragt "Aufnahme speichern?" -
+Ja speichert (wartet die Finalisierung ab), Nein verwirft die Datei sofort,
+Abbrechen laesst die Aufnahme weiterlaufen.
+
+**Systemton unter Windows:** Der derzeitige DirectShow-Aufnahmeweg benoetigt
+fuer Systemton eine Quelle wie „Stereomix“. Windows selbst unterstuetzt auch
+WASAPI-Loopback ohne Stereomix; dieser zusaetzliche Aufnahmeweg ist noch nicht
+integriert. Monitorlautsprecher ueber das Mikrofon aufzunehmen erfasst auch
+die Wiedergabe-, Raum- und Mikrofonverzoegerung.
+
+### Synchronitaet messen
+
+Im Projektordner (dieselbe Python-Umgebung wie fuer die App):
+
+```bash
+python sync_check.py generate sync_reference.mp4 --duration 30
+```
+
+Das Video abspielen und dessen Bildbereich mit dem Recorder aufnehmen;
+vor dem ersten Blitz starten und bis zum Ende aufnehmen. Fuer den bisherigen
+Mikrofontest die Toene ueber die Monitorlautsprecher abspielen und andere
+Geraeusche vermeiden. Danach:
+
+```bash
+python sync_check.py measure aufnahme.mp4
+```
+
+Bei Vollbildaufnahmen mit Player-Rahmen oder anderen hellen Flaechen den
+Testbildbereich mit `--crop Breite:Hoehe:X:Y` angeben. `--threshold -25`
+ist die Ton-Erkennungsschwelle in dB und bei leisen Aufnahmen anzupassen.
+Das Werkzeug meldet pro Ereignis den Tonversatz, dessen Median und die
+Aenderung zwischen erstem und letztem Ereignis. Positiv bedeutet Ton zu spaet.
+Es bricht bei ungleicher Ereigniszahl oder unregelmaessigen Abstaenden ab.
+Fehlen am Anfang/Ende ganze Ereignispaare, kann eine periodische Sequenz
+mehrdeutig sein: deshalb immer die gesamte Sequenz aufnehmen.
+
+Ein konstanter Versatz laesst sich mit dem Regler korrigieren; wechselnder
+Versatz oder Drift nicht. Bei 30 FPS ist die Bildaufloesung etwa 33 ms.
+Mehrere Starts und eine laengere Sequenz (z. B. `--duration 180`) vergleichen.
+Pause/Resume verwendet weiterhin Prozess-Suspend und ist noch nicht fuer
+synchronitaetskritische Aufnahmen abgesichert; fuer diese Tests nicht pausieren.
+
+Die alten A/B-Skripte (frueher `test_audio_sync.py`/`test_audio_sync_b.py`,
+jetzt `tools/audio_sync_variants_a.py` und `tools/audio_sync_variants_b.py`)
+sind nur noch historisch: sie stammen aus der bisherigen Fehlersuche und bauen
+Varianten aus dem jeweils aktuellen Builder. Nach dessen Aenderung
+reproduzieren sie die historischen A-/B-Befehle nicht mehr. Ihre Ausgabe landet
+in `tools/messungen/` (nicht versioniert, siehe `tools/README.md`). Fuer neue
+Messungen die normale App und `sync_check.py` verwenden.
+
+### Automatische Tests
+
+Ohne Windows, Bildschirm und Audiohardware (Fake-Prozesse). Tests, die echtes
+`ffmpeg` brauchen, und GUI-Tests ohne installiertes `customtkinter` werden
+uebersprungen. Entwicklungsabhaengigkeit einmalig installieren:
+
+```bash
+pip install -r bin/requirements-dev.txt
+```
+
+Beide Aufrufe jeweils **im Projektordner `projects/ScreenRecPro/`**:
+
+```bash
+pytest
+python -m unittest discover -s tests -v
+```
+
+`pytest.ini` beschraenkt die Sammlung auf `tests/`; die historischen Skripte in
+`tools/` werden nicht als Tests gesammelt (geprueft durch
+`tests/test_collect_guard.py`).
 
 ## Leistungstest ("System testen & optimieren")
 
