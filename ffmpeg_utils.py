@@ -406,17 +406,18 @@ def build_audio_input_args(
             *sync_args,
             "-f", "dshow",
             "-thread_queue_size", "1024",
-            # BEWUSST KEIN -audio_buffer_size mehr.
+            # -audio_buffer_size: VERSUCH gegen die Tonverspaetung (Stufe 2).
             #
-            # Frueher stand hier 80 ms, dann von mir auf 500 ms erhoeht -
-            # in der Annahme, ein ueberlaufender Puffer verursache die
-            # gemeldete Tonverzerrung. Die Messung auf echter Hardware
-            # hat das widerlegt: 500, 100, 50 ms und "gar nicht gesetzt"
-            # verhielten sich praktisch identisch (11,2 / 11,0 / 11,6 /
-            # 11,9 fps im Mittel). Der Wert war also nie die Ursache.
-            # Ohne ausdrueckliche Angabe gilt der Geraetestandard - ein
-            # Sonderwert weniger, der spaeter jemanden in die Irre
-            # fuehren kann.
+            # Fruehere Messung: Der Wert war NICHT die Ursache des Ruckelns
+            # (500/100/50 ms/ungesetzt: praktisch gleiche fps). Fuer den
+            # Ton-Bild-Versatz ist er aber noch nicht gemessen: Mit dem
+            # Geraetestandard (dshow: bis ca. 500 ms) kam der Ton bei zwei
+            # verschiedenen Mikrofonen konstant ca. 610-660 ms nach dem Bild
+            # (sync_check-artige Messung 03.11.2026, Blitz/Ton). Mit 50 ms
+            # wird gemessen, ob der Geraetepuffer die Verspaetung ausmacht.
+            # Bleibt der Versatz, ist der Wert wieder zu entfernen. Nur
+            # dieser eine Parameter ist gegenueber der Baseline geaendert.
+            "-audio_buffer_size", "50",
             # Realtime-Puffer von FFmpeg selbst - NICHT zu verwechseln mit
             # -audio_buffer_size, das den Puffer des Audiogeraets meint.
             # Standard sind nur ca. 3 MB; laeuft der ueber, verwirft FFmpeg

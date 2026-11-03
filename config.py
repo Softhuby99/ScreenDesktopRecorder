@@ -137,6 +137,8 @@ MIC_GAIN_STEPS = 25          # Schrittweite des Sliders
 # Manuelle Ton-Verschiebung bei Videoaufnahmen ("Ton-Versatz", in ms).
 # Negativ = Ton früher, positiv = Ton später. Für die Eigenverzögerung
 # mancher Geräte (v. a. Bluetooth-Headsets), die kein Zeitstempel erfasst.
-AUDIO_OFFSET_MIN_MS = -500
-AUDIO_OFFSET_MAX_MS = 500
-AUDIO_OFFSET_STEPS = 100     # -> 10-ms-Schritte
+# Bereich ±1000 ms: Messung 03.11.2026 (dshow, Mikrofon über Lautsprecher) ergab
+# ca. +610 bis +660 ms Tonverspätung - mehr als der frühere Bereich ±500 ms.
+AUDIO_OFFSET_MIN_MS = -1000
+AUDIO_OFFSET_MAX_MS = 1000
+AUDIO_OFFSET_STEPS = 200     # -> 10-ms-Schritte
