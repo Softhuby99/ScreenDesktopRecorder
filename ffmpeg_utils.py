@@ -415,9 +415,11 @@ def build_audio_input_args(
             # verschiedenen Mikrofonen konstant ca. 610-660 ms nach dem Bild
             # (sync_check-artige Messung 03.11.2026, Blitz/Ton). Mit 50 ms
             # wird gemessen, ob der Geraetepuffer die Verspaetung ausmacht.
+            # Ergebnis 03.11.2026 (Headset): 500 ms Standard -> +660 ms, 50 ms ->
+            # +200 ms Tonverspaetung. Jetzt Test mit 20 ms.
             # Bleibt der Versatz, ist der Wert wieder zu entfernen. Nur
             # dieser eine Parameter ist gegenueber der Baseline geaendert.
-            "-audio_buffer_size", "50",
+            "-audio_buffer_size", "20",
             # Realtime-Puffer von FFmpeg selbst - NICHT zu verwechseln mit
             # -audio_buffer_size, das den Puffer des Audiogeraets meint.
             # Standard sind nur ca. 3 MB; laeuft der ueber, verwirft FFmpeg
