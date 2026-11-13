@@ -67,7 +67,11 @@ jobs:
   # weiterhin 'sudo apt install ffmpeg' (siehe README).
   # ==========================================================================
   build-linux:
-    runs-on: ubuntu-latest
+    # Feste Ubuntu-Version statt ubuntu-latest: Die Binary bringt Tcl/Tk mit
+    # und braucht mindestens die glibc des Build-Systems. ubuntu-latest ist
+    # inzwischen neuer (glibc 2.42) als Ubuntu 24.04 (2.39) auf den
+    # Nutzer-PCs -> 'GLIBC_2.42 not found'. 24.04 laeuft auf 24.04 und neuer.
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Repo auschecken
