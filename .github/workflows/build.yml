@@ -73,31 +73,43 @@ jobs:
       - name: Repo auschecken
         uses: actions/checkout@v4
 
-      - name: Python einrichten
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
+      # Bewusst das System-Python von Ubuntu (nicht actions/setup-python):
+      # Nur dieses hat per 'python3-tk' das Modul tkinter. Mit dem
+      # Toolcache-Python fehlte tkinter in der Binary.
       - name: Systemabhaengigkeiten installieren
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-tk ffmpeg
+          sudo apt-get install -y python3-tk python3-venv python3-dev ffmpeg
 
-      - name: Abhaengigkeiten installieren
+      - name: Abhaengigkeiten installieren (venv)
         run: |
-          python -m pip install --upgrade pip
-          pip install -r bin/requirements.txt
-          pip install "pyinstaller>=6.3.0"
+          /usr/bin/python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r bin/requirements.txt
+          .venv/bin/pip install "pyinstaller>=6.3.0"
+
+      - name: Pruefen, dass tkinter und customtkinter importierbar sind
+        run: |
+          .venv/bin/python -c "import tkinter, customtkinter, psutil; print('Importe OK')"
 
       - name: Eigenstaendige Linux-Binary bauen
         run: |
-          pyinstaller \
+          .venv/bin/pyinstaller \
             --name "ScreenRecPro" \
             --onefile \
             --collect-all customtkinter \
             --collect-all sounddevice \
             --hidden-import "PIL._tkinter_finder" \
+            --hidden-import "tkinter" \
             main.py
+
+      - name: Binary-Selbsttest (Abhaengigkeiten im Paket vorhanden)
+        run: |
+          # Ohne Display endet main.py nach der Abhaengigkeitspruefung mit
+          # "Kein Display"; "FEHLENDE ABHAENGIGKEITEN" waere der Fehlerfall.
+          out=$(./dist/ScreenRecPro 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -q "FEHLENDE ABH"; then exit 1; fi
 
       - name: Binary als Download-Artefakt bereitstellen
         uses: actions/upload-artifact@v4
