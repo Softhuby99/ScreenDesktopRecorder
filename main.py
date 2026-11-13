@@ -28,16 +28,20 @@ def check_dependencies() -> list[str]:
 
     try:
         import tkinter  # noqa: F401
-    except ImportError:
+    except ImportError as exc:
         missing.append(
             "tkinter  ->  Linux: sudo apt install python3-tk\n"
-            "             Windows: Python neu installieren, 'tcl/tk' anhaken"
+            "             Windows: Python neu installieren, 'tcl/tk' anhaken\n"
+            f"             Technische Ursache: {exc!r}"
         )
 
     try:
         import customtkinter  # noqa: F401
-    except ImportError:
-        missing.append("customtkinter  ->  pip install customtkinter")
+    except ImportError as exc:
+        missing.append(
+            "customtkinter  ->  pip install customtkinter\n"
+            f"             Technische Ursache: {exc!r}"
+        )
 
     try:
         import psutil  # noqa: F401
