@@ -260,6 +260,22 @@ class WorkerTest(unittest.TestCase):
         self.assertIn("SCHWANKEND", open(r["log_path"], encoding="utf-8").read())
         self.assertEqual(len([f for f in os.listdir(self.tmp) if f.endswith(".mp4")]), 3)
 
+    def test_draw_delay_is_added_per_run(self):
+        delays = []
+        t = c.CalibrationThread(
+            {"fps": "30", "audio_device": "Mic"}, None, log_dir=self.tmp, runs=2,
+            on_flash=lambda due: delays.append(250.0), flash_delays=lambda: list(delays),
+            on_finish=lambda r: results.append(r), player_factory=FakePlayer,
+            popen=FakeProcess, analyze=lambda p, crop: run_result(510),
+        )
+        results = []
+        t.start()
+        t.join(5)
+        r = results[0]
+        # gemessen 510, Blinken 250 ms zu spät gezeichnet -> echte Verspätung 760
+        self.assertEqual(r["true_ms"][0], 760)
+        self.assertIn("+250 ms", open(r["log_path"], encoding="utf-8").read())
+
     def test_two_failures_stop_early(self):
         calls = []
         ev = self._run(lambda p, crop: calls.append(1) or run_result(0, ok=False))
@@ -358,10 +374,50 @@ class OutputFormatTest(unittest.TestCase):
             p._prepare(8000, 2)
             out = bytearray(2 * 2 * 4000)
             ti = mock.Mock(outputBufferDacTime=10.05, currentTime=10.0)
-            p._callback(out, 4000, ti, None)    # erster Ton bei Frame 2400
-        self.assertEqual(len(beeps), 1)
-        self.assertEqual(p.dac_beeps, 1)
+            before = c.time.perf_counter()
+            p._callback(out, 4000, ti, None)    # erster Block: plant ALLE Töne
+            dues = [p._queue.get_nowait(), p._queue.get_nowait()]
+            self.assertTrue(p._queue.empty())
+            # zweiter Block, Ausgabe 30 ms später als geplant -> Taktabweichung
+            ti2 = mock.Mock(outputBufferDacTime=10.58, currentTime=10.5)
+            with mock.patch.object(c.time, "perf_counter", return_value=p._base - 0.05 + 0.5):
+                p._callback(bytearray(len(out)), 4000, ti2, mock.Mock(output_underflow=True))
+        self.assertEqual(beeps, [])              # nie direkt aus dem Audio-Callback
+        self.assertEqual(p.dac_beeps, 2)
+        self.assertAlmostEqual(dues[1] - dues[0], 1.0, places=6)
+        self.assertAlmostEqual(dues[0] - before, 0.05 + c.SIGNAL_PAD_S, delta=0.05)
+        self.assertEqual(round(p.max_drift_ms), 30)
+        self.assertEqual(p.underruns, 1)
         self.assertEqual(bytes(out), p._pcm[:len(out)])
+
+    def test_beeps_are_forwarded_from_own_thread(self):
+        sd = self._fake_sd()
+        got = []
+        stream = mock.MagicMock()
+        stream.latency, stream.device = 0.01, 7
+        sd.RawOutputStream.side_effect = None
+        sd.RawOutputStream.return_value = stream
+        seen = threading.Event()
+
+        def on_beep(due):
+            got.append((due, threading.current_thread().name))
+            if len(got) == 2:
+                seen.set()
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            p = c.BeepPlayer(on_beep, beeps=2, interval=1.0)
+            p.start()
+            ti = mock.Mock(outputBufferDacTime=5.02, currentTime=5.0)
+            p._callback(bytearray(2 * 2 * 1000), 1000, ti, None)
+            self.assertTrue(seen.wait(2))
+            p.stop()
+            p._forwarder.join(2)
+        self.assertFalse(p._forwarder.is_alive())
+        self.assertNotEqual(got[0][1], threading.current_thread().name)
+
+    def test_draw_delay(self):
+        self.assertEqual(c.draw_delay_ms([10.2, 250.0, 12.0]), 12)
+        self.assertEqual(c.draw_delay_ms([-3.0]), 0)
+        self.assertEqual(c.draw_delay_ms([]), 0)
 
 
 if __name__ == "__main__":

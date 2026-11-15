@@ -26,6 +26,7 @@ Die Bausteine (Signal, Auswertung, BeepPlayer) nutzt auch syncfix.py.
 import array
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -428,9 +429,22 @@ class BeepPlayer:
     auf einem Realtek-Notebook, die App wich unbemerkt auf MME aus, dessen
     gemeldete Latenz ungenau ist.
 
+    Zeitplan: Beim ERSTEN Audio-Block wird aus der gemeldeten Ausgabezeit
+    berechnet, wann jeder Piepton den Lautsprecher erreicht, und alle
+    Zeitpunkte werden sofort gemeldet. Die GUI hat dadurch mindestens
+    SIGNAL_PAD_S Vorlauf - früher kam die Meldung erst im Block des Tons
+    selbst (Vorlauf nur die Ausgabelatenz, bei WASAPI ca. 10-30 ms), was
+    für den Weg zur GUI zu knapp sein kann.
+
+    on_beep wird NIE aus dem Audio-Callback aufgerufen, sondern aus einem
+    eigenen Weiterleitungs-Thread: Der Aufruf landet in Tk (after), und
+    ein Tk-Aufruf aus einem fremden Thread wartet auf die GUI-Schleife -
+    das würde den Audio-Callback blockieren (Aussetzer im Piepton).
+
     Nach dem Lauf für das Protokoll: device_info, latency_s, dac_beeps
-    (wie viele Zeitpunkte aus outputBufferDacTime stammen), errors
-    (gescheiterte Versuche mit Fehlermeldung).
+    (Zeitpunkte aus outputBufferDacTime), errors (gescheiterte Versuche),
+    underruns (Aussetzer der Tonausgabe), max_drift_ms (größte Abweichung
+    der tatsächlichen Ausgabezeit vom Zeitplan).
     """
 
     def __init__(self, on_beep, beeps: int = CALIB_BEEPS, interval: float = CALIB_INTERVAL_S):
@@ -447,6 +461,22 @@ class BeepPlayer:
         self.device_info = ""
         self.dac_beeps = 0
         self.errors: list[str] = []
+        self.underruns = 0
+        self.max_drift_ms = 0.0
+        self._base = None                 # perf_counter-Zeit, zu der Frame 0 hörbar wird
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._forwarder = None
+
+    def _forward(self):
+        """Weiterleitungs-Thread: gibt geplante Zeitpunkte an on_beep."""
+        while True:
+            due = self._queue.get()
+            if due is None:
+                return
+            try:
+                self._on_beep(due)
+            except Exception:
+                pass
 
     def _prepare(self, rate: int, channels: int):
         self._rate, self._channels = rate, channels
@@ -454,6 +484,7 @@ class BeepPlayer:
                                   channels=channels)
         self._starts = beep_start_samples(rate, self._beeps, self._interval)
         self._pos = 0
+        self._base = None
 
     def _callback(self, outdata, frames, time_info, status):
         import sounddevice as sd
@@ -466,18 +497,20 @@ class BeepPlayer:
         now = time.perf_counter()
         dac = getattr(time_info, "outputBufferDacTime", 0.0) or 0.0
         cur = getattr(time_info, "currentTime", 0.0) or 0.0
-        for s in self._starts:
-            if self._pos <= s < self._pos + frames:
-                offset = (s - self._pos) / self._rate
-                if dac > 0 and cur > 0 and dac >= cur:
-                    delay = dac - cur + offset
-                    self.dac_beeps += 1
-                else:
-                    delay = self.latency_s + offset
-                try:
-                    self._on_beep(now + delay)
-                except Exception:
-                    pass
+        has_dac = dac > 0 and cur > 0 and dac >= cur
+        lead = (dac - cur) if has_dac else self.latency_s
+        # perf_counter-Zeit, zu der Frame 0 des Signals hörbar wäre
+        base_now = now + lead - self._pos / self._rate
+        if self._base is None:
+            self._base = base_now
+            if has_dac:
+                self.dac_beeps = len(self._starts)
+            for s in self._starts:
+                self._queue.put(self._base + s / self._rate)
+        else:
+            self.max_drift_ms = max(self.max_drift_ms, abs(base_now - self._base) * 1000.0)
+        if status and getattr(status, "output_underflow", False):
+            self.underruns += 1
         self._pos += frames
         if self._pos * frame_bytes >= len(self._pcm):
             raise sd.CallbackStop
@@ -535,6 +568,8 @@ class BeepPlayer:
                     self.device_info = f"{info['name']} [{api}, {rate} Hz, {channels} Kan.]"
                 except Exception:
                     self.device_info = f"{name} [{rate} Hz, {channels} Kan.]"
+                self._forwarder = threading.Thread(target=self._forward, daemon=True)
+                self._forwarder.start()
                 self._stream.start()
                 return
             except Exception as exc:
@@ -553,7 +588,32 @@ class BeepPlayer:
                 stream.close()
             except Exception:
                 pass
+        self._queue.put(None)             # Weiterleitungs-Thread beenden
         self.done.set()
+
+
+def player_report(player) -> dict:
+    """Angaben zur Tonausgabe fürs Protokoll (Kalibrierung und Sync-Marker)."""
+    return {
+        "device": getattr(player, "device_info", ""),
+        "latency_ms": int(round(getattr(player, "latency_s", 0.0) * 1000)),
+        "dac_beeps": getattr(player, "dac_beeps", 0),
+        "errors": list(getattr(player, "errors", [])),
+        "underruns": getattr(player, "underruns", 0),
+        "max_drift_ms": int(round(getattr(player, "max_drift_ms", 0.0))),
+    }
+
+
+def draw_delay_ms(delays) -> int:
+    """
+    Wie viel später als geplant das Blinken gezeichnet wurde (Median, ms).
+    Um diesen Betrag erscheint der Blitz zu spät im Bild - die gemessene
+    Tonverspätung ist dann um genau so viel zu klein und wird korrigiert.
+    """
+    values = [float(d) for d in (delays or []) if d is not None]
+    if not values:
+        return 0
+    return max(0, int(round(median(values))))
 
 
 def play_signal(player, cancelled: threading.Event, beeps: int, interval: float) -> None:
@@ -599,7 +659,8 @@ def format_calibration_log(device: str, settings: dict, crop, runs: list[dict],
         f"Blinkfeld:      {crop}",
         f"Tonausgabe:     {player_info.get('device', '?')}, gemeldete Latenz "
         f"{player_info.get('latency_ms', '?')} ms, Zeitpunkte aus DAC-Zeit: "
-        f"{player_info.get('dac_beeps', '?')}",
+        f"{player_info.get('dac_beeps', '?')}, Aussetzer: {player_info.get('underruns', '?')}, "
+        f"größte Taktabweichung: {player_info.get('max_drift_ms', '?')} ms",
     ]
     for err in player_info.get("errors") or []:
         lines.append(f"   nicht genutzt: {err}")
@@ -608,7 +669,8 @@ def format_calibration_log(device: str, settings: dict, crop, runs: list[dict],
         head = f"Durchlauf {i}: Versatz angewendet {int(r.get('applied_ms', 0)):+d} ms -> "
         if r.get("ok"):
             head += (f"gemessen {r['lateness_ms']:+d} ms, Streuung {r['spread_ms']} ms, "
-                     f"{r['pairs']} Paare")
+                     f"{r['pairs']} Paare (darin {int(r.get('draw_delay_ms', 0)):+d} ms für "
+                     f"verspätet gezeichnetes Blinken)")
         else:
             head += f"FEHLER: {r.get('reason')}"
         lines.append(head)
@@ -641,13 +703,15 @@ class CalibrationThread(threading.Thread):
     :param crop:            Blinkfeld relativ zum aufgenommenen Bild
     :param log_dir:         Ordner für Protokoll (und ggf. Messaufnahmen)
     :param on_flash:        Callback(perf_counter-Zeitpunkt) - GUI blitzt dann
+    :param flash_delays:    Callable -> Liste (ms), wie viel später als geplant
+                            jeder Blitz bisher gezeichnet wurde (GUI führt sie)
     :param on_progress:     Callback(text)
     :param on_finish:       Callback(summary aus combine_runs + "log_path")
     :param on_error:        Callback(text)
     """
 
     def __init__(self, record_settings: dict, crop, log_dir: str | None = None,
-                 runs: int = CALIB_RUNS, on_flash=None, on_progress=None,
+                 runs: int = CALIB_RUNS, on_flash=None, flash_delays=None, on_progress=None,
                  on_finish=None, on_error=None, player_factory=BeepPlayer,
                  popen=subprocess.Popen, analyze=analyze_file):
         super().__init__(daemon=True)
@@ -657,6 +721,7 @@ class CalibrationThread(threading.Thread):
         self.runs = runs
         self.on_flash, self.on_progress = on_flash, on_progress
         self.on_finish, self.on_error = on_finish, on_error
+        self._flash_delays = flash_delays or (lambda: [])
         self._player_factory, self._popen, self._analyze = player_factory, popen, analyze
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
@@ -732,13 +797,9 @@ class CalibrationThread(threading.Thread):
                 raise InterruptedError
             self._player = player
         self._emit(self.on_progress, f"Durchlauf {index}/{self.runs}: Pieptöne ...")
+        drawn_before = len(self._flash_delays())
         play_signal(player, self._cancelled, CALIB_BEEPS, CALIB_INTERVAL_S)
-        self.player_info = {
-            "device": getattr(player, "device_info", ""),
-            "latency_ms": int(round(getattr(player, "latency_s", 0.0) * 1000)),
-            "dac_beeps": getattr(player, "dac_beeps", 0),
-            "errors": list(getattr(player, "errors", [])),
-        }
+        self.player_info = player_report(player)
         with self._lock:
             self._player = None
         self._sleep(CALIB_TAIL_S)
@@ -751,6 +812,11 @@ class CalibrationThread(threading.Thread):
         self._emit(self.on_progress, f"Durchlauf {index}/{self.runs}: Auswertung ...")
         result = dict(self._analyze(path, self.crop))
         result["applied_ms"] = applied_ms
+        # Verspätet gezeichnetes Blinken einrechnen (siehe draw_delay_ms)
+        delay = draw_delay_ms(self._flash_delays()[drawn_before:])
+        result["draw_delay_ms"] = delay
+        if result.get("ok"):
+            result["lateness_ms"] = int(result["lateness_ms"]) + delay
         return result
 
     def run(self):

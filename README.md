@@ -121,7 +121,7 @@ oder Schwankung zusaetzlich die Messaufnahmen).
 **Sync-Marker (Windows, je Mikrofon):** Fuer Mikrofone mit schwankender
 Verzoegerung. Zu Beginn jeder Aufnahme blinkt ca. 6 s lang ein Feld im
 Aufnahmebereich, dazu Piepstoene. Nach dem Stoppen misst die App den Versatz
-genau in dieser Datei, schneidet den Anfang samt Marker ab (am naechsten
+genau in dieser Datei, schneidet den Anfang samt Marker ab (ca. 8 s, am naechsten
 Schluesselbild, das Bild wird nicht neu kodiert) und legt den Ton exakt
 darunter (Ton neu als AAC). Gelingt das nicht, bleibt die Datei unveraendert;
 das Aufnahme-Log nennt den Grund.

@@ -37,7 +37,7 @@ from audio_devices import (
 from audio_meter import LevelMeter
 from calibration import (
     CALIB_FLASH_S, SOURCE_CALIBRATED, SOURCE_MANUAL, CalibrationThread,
-    offset_note, remember_offset, stored_offset,
+    draw_delay_ms, offset_note, remember_offset, stored_offset,
 )
 from syncfix import MarkerThread, SyncFixThread, describe_fix
 from benchmark import BenchmarkThread
@@ -1502,8 +1502,16 @@ class MainWindow(ctk.CTk):
         self.after(delay_ms + int(CALIB_FLASH_S * 1000), off)
 
     # ---- Kalibrierung -------------------------------------------------
+    def _syncfix_active(self) -> bool:
+        t = getattr(self, "_syncfix_thread", None)
+        return t is not None and t.is_alive()
+
     def _start_calibration(self):
         if self._closing or self._calibrating() or self.recorder is not None:
+            return
+        if self._syncfix_active():
+            self._set_status("Bitte warten – die letzte Aufnahme wird noch synchronisiert.",
+                             COLOR_WARNING)
             return
         if self.benchmark_thread is not None and self.benchmark_thread.is_alive():
             return
@@ -1559,6 +1567,7 @@ class MainWindow(ctk.CTk):
             crop=plan["crop"],
             log_dir=folder if os.path.isdir(folder) else None,
             on_flash=lambda due: self._post_to_gui(self._flash_at, due),
+            flash_delays=lambda: list(self._flash_delays),
             on_progress=lambda t: self._post_to_gui(self._calib_progress, t),
             on_finish=lambda r: self._post_to_gui(self._calib_finish, r),
             on_error=lambda m: self._post_to_gui(self._calib_error, m),
@@ -1633,9 +1642,14 @@ class MainWindow(ctk.CTk):
     # ---- Sync-Marker (während der Aufnahme) -----------------------------
     def _on_sync_marker_toggle(self):
         ident = self._current_audio_ident()
-        if ident:
-            self._sync_markers[ident] = bool(self.sync_marker_var.get())
-            self._save_settings()
+        if not ident:
+            # Der Haken gilt je Mikrofon - ohne Tonquelle gibt es nichts zu merken.
+            self.sync_marker_var.set(False)
+            self._set_status("Sync-Marker: bitte zuerst ein Mikrofon als Tonquelle wählen.",
+                             COLOR_WARNING)
+            return
+        self._sync_markers[ident] = bool(self.sync_marker_var.get())
+        self._save_settings()
 
     def _plan_marker(self, audio_device, audio_label: str, audio_only: bool,
                      mode_region: bool, region) -> dict | None:
@@ -1675,12 +1689,23 @@ class MainWindow(ctk.CTk):
             except Exception:
                 self._marker_end_s = None
 
-    def _run_syncfix(self, path: str, after):
-        """Korrektur im Hintergrund; danach after(cut_s) im GUI-Thread."""
+    def _run_syncfix(self, path: str, log_path, after):
+        """
+        Korrektur im Hintergrund; danach after(result, cut_s) im GUI-Thread.
+        Das Ergebnis schreibt der Worker selbst ins Log (reine Datei-Ein-/
+        Ausgabe) - so steht es auch dann drin, wenn die App gerade schließt
+        und _post_to_gui den GUI-Auftrag verwirft.
+        """
         self._set_status("Ton wird mit dem Bild synchronisiert ...", COLOR_TEXT_MUTED)
+
+        def finished(res):
+            self._append_recording_log(log_path, describe_fix(res))
+            self._post_to_gui(self._syncfix_done, res, after)
+
         self._syncfix_thread = SyncFixThread(
             path, self._marker_plan["crop"], self._marker_end_s,
-            on_finish=lambda res: self._post_to_gui(self._syncfix_done, res, after),
+            draw_delay_ms=draw_delay_ms(self._flash_delays),
+            on_finish=finished,
         )
         self._syncfix_thread.start()
 
@@ -1700,6 +1725,12 @@ class MainWindow(ctk.CTk):
         if self._closing or self._calibrating():
             return
         if self.recorder is not None:
+            return
+        if self._syncfix_active():
+            # Die Korrektur liest Zustand dieser Aufnahme (Marker, Tonquelle);
+            # eine neue Aufnahme würde ihn überschreiben.
+            self._set_status("Bitte warten – die letzte Aufnahme wird noch synchronisiert.",
+                             COLOR_WARNING)
             return
 
         folder = self.path_var.get().strip()
@@ -1914,10 +1945,9 @@ class MainWindow(ctk.CTk):
                 self._append_recording_log(log_path, marker_note)
             if (self._marker_plan and self._marker_end_s and not self._active_audio_only):
                 def after(result, cut_s):
-                    self._append_recording_log(log_path, describe_fix(result))
                     self._finish_saved(path, max(0.0, elapsed - cut_s), log_path,
                                        requested_fps, audio_offset_ms, result)
-                self._run_syncfix(path, after)
+                self._run_syncfix(path, log_path, after)
                 return
             self._finish_saved(path, elapsed, log_path, requested_fps, audio_offset_ms)
         else:
@@ -1940,6 +1970,8 @@ class MainWindow(ctk.CTk):
         note = (f"Sync-Marker:    abgespielt über {info.get('device') or '?'} "
                 f"(gemeldete Latenz {info.get('latency_ms')} ms), Ende bei "
                 f"{self._marker_end_s:.2f} s\n                {self._flash_timing_note()}")
+        note += (f"\n                Tonausgabe: Aussetzer {info.get('underruns', '?')}, "
+                 f"größte Taktabweichung {info.get('max_drift_ms', '?')} ms")
         for err in info.get("errors") or []:
             note += f"\n                nicht genutzt: {err}"
         return note

@@ -33,8 +33,27 @@ class PureTest(unittest.TestCase):
         second = cmd.index("-ss", cmd.index("-ss") + 1)
         self.assertEqual(cmd[second + 1], "6.800000")
 
-    def test_marker_flashes_ignore_later_content(self):
-        self.assertEqual(s.marker_flashes([2.0, 4.0, 6.0, 9.0], 6.2), [2.0, 4.0, 6.0])
+    def test_pick_marker_flashes_by_raster(self):
+        # 6.5: Bildinhalt wird hell, als das Marker-Fenster schließt
+        self.assertEqual(s.pick_marker_flashes([2.0, 4.03, 6.0, 6.5, 9.0]), [2.0, 4.03, 6.0])
+        # erster Blitz verpasst (FFmpeg lief noch nicht): zwei bleiben
+        self.assertEqual(s.pick_marker_flashes([4.0, 6.0]), [4.0, 6.0])
+        # Störung vor dem Marker
+        self.assertEqual(s.pick_marker_flashes([0.4, 2.0, 4.0, 6.0]), [2.0, 4.0, 6.0])
+        self.assertEqual(s.pick_marker_flashes([]), [])
+
+    def test_earliest_cut_covers_clock_lead_and_last_flash(self):
+        # App-Uhr 6,2 s; Dateizeit kann bis ca. 1 s voraus sein
+        self.assertGreaterEqual(s.earliest_cut(6.2, None), 6.2 + 1.0)
+        # letzter Blitz spät in der Datei -> Schnitt sicher hinter Signalende
+        self.assertGreaterEqual(s.earliest_cut(6.2, 6.9), 6.9 + 0.42 + 1.0)
+
+    def test_check_fixed_file(self):
+        orig = {"duration": 60.0, "video": True, "audio": True}
+        self.assertEqual(s.check_fixed_file(orig, {"duration": 52.3, "video": True, "audio": True}, 8.0), "")
+        self.assertIn("Spuren", s.check_fixed_file(orig, {"duration": 52.0, "video": True, "audio": False}, 8.0))
+        self.assertIn("unplausibel", s.check_fixed_file(orig, {"duration": 20.0, "video": True, "audio": True}, 8.0))
+        self.assertIn("nicht lesbar", s.check_fixed_file(orig, {"duration": None, "video": True, "audio": True}, 8.0))
 
     def test_describe(self):
         ok = {"fixed": True, "lateness_ms": 310, "cut_s": 7.0, "spread_ms": 10, "pairs": 3}
@@ -80,6 +99,7 @@ class MarkerThreadTest(unittest.TestCase):
         self.assertEqual(len(flashes), s.MARKER_BEEPS)
         self.assertTrue(done[0]["ok"])
         self.assertEqual(done[0]["latency_ms"], 20)
+        self.assertEqual(done[0]["underruns"], 0)
 
     def test_cancel(self):
         done = []
@@ -132,11 +152,63 @@ class SyncFixThreadTest(unittest.TestCase):
         self.assertEqual(os.listdir(self.dir), ["a.mp4"])
 
 
+    def _ok_proc(self):
+        tmp = os.path.join(self.dir, "a.sync-tmp.mp4")
+
+        class Proc:
+            returncode = 0
+
+            def __init__(self, cmd, **k):
+                self.cmd = cmd
+                Proc.last = cmd
+                with open(tmp, "wb") as f:
+                    f.write(b"neu")
+
+            def communicate(self):
+                return b"", b""
+
+            def poll(self):
+                return 0
+        return Proc
+
+    def test_implausible_result_keeps_original(self):
+        res = {}
+        probes = iter([{"duration": 60.0, "video": True, "audio": True},
+                       {"duration": 5.0, "video": True, "audio": True}])
+        t = s.SyncFixThread(self.path, None, 6.0, on_finish=res.update,
+                            analyze=lambda p, crop, end: {"ok": True, "cut_s": 8.0, "lateness_ms": 100},
+                            popen=self._ok_proc(), probe=lambda p: next(probes))
+        t.start()
+        t.join(5)
+        self.assertFalse(res["fixed"])
+        self.assertIn("unplausibel", res["reason"])
+        self.assertEqual(open(self.path, "rb").read(), b"original")
+        self.assertEqual(os.listdir(self.dir), ["a.mp4"])
+
+    def test_success_replaces_and_adds_draw_delay(self):
+        res = {}
+        probes = iter([{"duration": 60.0, "video": True, "audio": True},
+                       {"duration": 52.0, "video": True, "audio": True}])
+        proc = self._ok_proc()
+        with mock.patch.object(s, "get_ffmpeg_path", return_value="ffmpeg"):
+            t = s.SyncFixThread(self.path, None, 6.0, on_finish=res.update, draw_delay_ms=40,
+                                analyze=lambda p, crop, end: {"ok": True, "cut_s": 8.0, "lateness_ms": 100},
+                                popen=proc, probe=lambda p: next(probes))
+            t.start()
+            t.join(5)
+        self.assertTrue(res["fixed"])
+        self.assertEqual(res["lateness_ms"], 140)
+        second = proc.last.index("-ss", proc.last.index("-ss") + 1)
+        self.assertEqual(proc.last[second + 1], "8.140000")
+        self.assertEqual(open(self.path, "rb").read(), b"neu")
+        self.assertEqual(os.listdir(self.dir), ["a.mp4"])
+
+
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg fehlt")
 class EndToEndTest(unittest.TestCase):
     """Erzeugte Aufnahme mit Marker + Kontrollereignissen, Ton zu spät/zu früh."""
 
-    def _make(self, lag, rate):
+    def _make(self, lag, rate, preset="ultrafast"):
         fd, path = tempfile.mkstemp(suffix=".mp4")
         os.close(fd)
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
@@ -148,7 +220,7 @@ class EndToEndTest(unittest.TestCase):
              f"aevalsrc=exprs='0.4*sin(2*PI*1000*t)*{ga}+0.03*(random(0)-0.5)':s=48000:d=21",
              "-vf", ("drawbox=x=100:y=80:w=240:h=140:color=black:t=fill,"
                      f"drawbox=x=100:y=80:w=240:h=140:color=white:t=fill:enable='{gv}'"),
-             "-c:v", "libx264", "-preset", "ultrafast", "-g", str(2 * rate),
+             "-c:v", "libx264", "-preset", preset, "-g", str(2 * rate),
              "-force_key_frames", "expr:lt(t,30)*gte(t,n_forced*0.5)",
              "-c:a", "aac", path],
             check=True,
@@ -159,8 +231,10 @@ class EndToEndTest(unittest.TestCase):
         crop = (108, 88, 224, 124)
         with mock.patch.object(s, "get_ffmpeg_path", return_value="ffmpeg"), \
              mock.patch.object(c, "get_ffmpeg_path", return_value="ffmpeg"):
-            for lag, rate in ((0.81, 30), (-0.2, 60)):
-                path = self._make(lag, rate)
+            # veryfast/medium: mit B-Frames, wie in echten Aufnahmen
+            for lag, rate, preset in ((0.81, 30, "veryfast"), (-0.2, 60, "ultrafast"),
+                                      (0.2, 30, "medium")):
+                path = self._make(lag, rate, preset)
                 res = {}
                 t = s.SyncFixThread(path, crop, 6.6, on_finish=res.update)
                 t.start()
