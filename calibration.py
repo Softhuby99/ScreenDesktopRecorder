@@ -77,10 +77,11 @@ def beep_start_samples(rate: int = CALIB_SAMPLE_RATE, beeps: int = CALIB_BEEPS,
 
 
 def make_beep_pcm(rate: int = CALIB_SAMPLE_RATE, amplitude: float = 0.5,
-                  beeps: int = CALIB_BEEPS, interval: float = CALIB_INTERVAL_S) -> bytes:
+                  beeps: int = CALIB_BEEPS, interval: float = CALIB_INTERVAL_S,
+                  channels: int = 1) -> bytes:
     """
-    Mono-PCM (int16, little endian) mit Pieptönen und je 5 ms
-    Ein-/Ausblendung gegen Knacken. Ohne NumPy (array-Modul).
+    PCM (int16, little endian, Kanäle verschränkt) mit Pieptönen und je
+    5 ms Ein-/Ausblendung gegen Knacken. Ohne NumPy (array-Modul).
     """
     starts = beep_start_samples(rate, beeps, interval)
     beep_len = int(CALIB_BEEP_S * rate)
@@ -93,6 +94,11 @@ def make_beep_pcm(rate: int = CALIB_SAMPLE_RATE, amplitude: float = 0.5,
         for i in range(beep_len):
             env = min(1.0, i / fade, (beep_len - 1 - i) / fade)
             pcm[start + i] = int(peak * env * math.sin(w * i))
+    if channels > 1:
+        multi = array.array("h", bytes(2 * total * channels))
+        for ch in range(channels):
+            multi[ch::channels] = pcm
+        pcm = multi
     if sys.byteorder != "little":
         pcm.byteswap()
     return pcm.tobytes()
@@ -416,29 +422,46 @@ class BeepPlayer:
     meldet für jeden den Zeitpunkt, an dem er aus dem Lautsprecher kommt:
     on_beep(perf_counter-Zeitpunkt).
 
+    WASAPI bevorzugt (genaue Ausgabezeit) - und zwar im STANDARDFORMAT des
+    Geräts (Kanäle, Abtastrate): Im gemeinsamen Modus nimmt WASAPI oft nur
+    genau dieses Format an. Ein fest eingestelltes Mono/48 kHz scheiterte
+    auf einem Realtek-Notebook, die App wich unbemerkt auf MME aus, dessen
+    gemeldete Latenz ungenau ist.
+
     Nach dem Lauf für das Protokoll: device_info, latency_s, dac_beeps
-    (wie viele Zeitpunkte aus outputBufferDacTime stammen).
+    (wie viele Zeitpunkte aus outputBufferDacTime stammen), errors
+    (gescheiterte Versuche mit Fehlermeldung).
     """
 
-    def __init__(self, on_beep, beeps: int = CALIB_BEEPS, interval: float = CALIB_INTERVAL_S,
-                 rate: int = CALIB_SAMPLE_RATE):
+    def __init__(self, on_beep, beeps: int = CALIB_BEEPS, interval: float = CALIB_INTERVAL_S):
         self._on_beep = on_beep
-        self._rate = rate
-        self._pcm = make_beep_pcm(rate, beeps=beeps, interval=interval)
-        self._starts = beep_start_samples(rate, beeps, interval)
-        self._pos = 0
+        self._beeps, self._interval = beeps, interval
+        self._rate = CALIB_SAMPLE_RATE
+        self._channels = 1
+        self._pcm = b""
+        self._starts: list[int] = []
+        self._pos = 0                     # in Frames
         self._stream = None
         self.done = threading.Event()
         self.latency_s = 0.0
         self.device_info = ""
         self.dac_beeps = 0
+        self.errors: list[str] = []
+
+    def _prepare(self, rate: int, channels: int):
+        self._rate, self._channels = rate, channels
+        self._pcm = make_beep_pcm(rate, beeps=self._beeps, interval=self._interval,
+                                  channels=channels)
+        self._starts = beep_start_samples(rate, self._beeps, self._interval)
+        self._pos = 0
 
     def _callback(self, outdata, frames, time_info, status):
         import sounddevice as sd
-        start_byte = self._pos * 2
-        chunk = self._pcm[start_byte:start_byte + frames * 2]
-        if len(chunk) < frames * 2:
-            chunk = chunk + bytes(frames * 2 - len(chunk))
+        frame_bytes = 2 * self._channels
+        start_byte = self._pos * frame_bytes
+        chunk = self._pcm[start_byte:start_byte + frames * frame_bytes]
+        if len(chunk) < frames * frame_bytes:
+            chunk = chunk + bytes(frames * frame_bytes - len(chunk))
         outdata[:] = chunk
         now = time.perf_counter()
         dac = getattr(time_info, "outputBufferDacTime", 0.0) or 0.0
@@ -456,26 +479,49 @@ class BeepPlayer:
                 except Exception:
                     pass
         self._pos += frames
-        if self._pos * 2 >= len(self._pcm):
+        if self._pos * frame_bytes >= len(self._pcm):
             raise sd.CallbackStop
+
+    @staticmethod
+    def output_attempts(sd) -> list[tuple]:
+        """
+        Versuche in Reihenfolge: (Gerät, Rate, Kanäle, extra_settings, Name).
+        Reine Ableitung aus den Geräteangaben - testbar mit einem Ersatz-sd.
+        """
+        attempts = []
+        wasapi = _wasapi_default_output()
+        if wasapi is not None:
+            try:
+                info = sd.query_devices(wasapi)
+                rate = int(round(float(info.get("default_samplerate") or CALIB_SAMPLE_RATE)))
+                channels = 2 if int(info.get("max_output_channels") or 1) >= 2 else 1
+            except Exception:
+                rate, channels = CALIB_SAMPLE_RATE, 2
+            attempts.append((wasapi, rate, channels, None, "WASAPI"))
+            try:
+                auto = sd.WasapiSettings(auto_convert=True)
+                attempts.append((wasapi, CALIB_SAMPLE_RATE, 1, auto, "WASAPI auto_convert"))
+            except Exception as exc:
+                attempts.append(("skip", 0, 0, None, f"WASAPI auto_convert nicht verfügbar ({exc})"))
+        try:
+            info = sd.query_devices(kind="output")
+            rate = int(round(float(info.get("default_samplerate") or CALIB_SAMPLE_RATE)))
+        except Exception:
+            rate = CALIB_SAMPLE_RATE
+        attempts.append((None, rate, 2, None, "Standard-Schnittstelle"))
+        attempts.append((None, CALIB_SAMPLE_RATE, 1, None, "Standard-Schnittstelle mono"))
+        return attempts
 
     def start(self):
         import sounddevice as sd
-        wasapi = _wasapi_default_output()
-        attempts = []
-        if wasapi is not None:
+        for device, rate, channels, extra, name in self.output_attempts(sd):
+            if device == "skip":
+                self.errors.append(name)
+                continue
             try:
-                # Mono/48 kHz notfalls von Windows umrechnen lassen
-                attempts.append((wasapi, sd.WasapiSettings(auto_convert=True)))
-            except Exception:
-                pass
-            attempts.append((wasapi, None))
-        attempts.append((None, None))   # Standardgerät der Standard-Schnittstelle
-        last_error = None
-        for device, extra in attempts:
-            try:
+                self._prepare(rate, channels)
                 self._stream = sd.RawOutputStream(
-                    samplerate=self._rate, channels=1, dtype="int16",
+                    samplerate=rate, channels=channels, dtype="int16",
                     device=device, latency="low", callback=self._callback,
                     finished_callback=self.done.set, extra_settings=extra,
                 )
@@ -486,15 +532,15 @@ class BeepPlayer:
                     dev = dev[1] if isinstance(dev, (tuple, list)) else dev
                     info = sd.query_devices(dev)
                     api = sd.query_hostapis(info["hostapi"])["name"]
-                    self.device_info = f"{info['name']} [{api}]"
+                    self.device_info = f"{info['name']} [{api}, {rate} Hz, {channels} Kan.]"
                 except Exception:
-                    self.device_info = str(device)
+                    self.device_info = f"{name} [{rate} Hz, {channels} Kan.]"
                 self._stream.start()
                 return
             except Exception as exc:
-                last_error = exc
+                self.errors.append(f"{name} ({rate} Hz, {channels} Kan.): {exc}")
                 self._stream = None
-        raise RuntimeError(f"Tonausgabe nicht möglich: {last_error}")
+        raise RuntimeError("Tonausgabe nicht möglich: " + " | ".join(self.errors[-2:]))
 
     def stop(self):
         stream, self._stream = self._stream, None
@@ -554,8 +600,10 @@ def format_calibration_log(device: str, settings: dict, crop, runs: list[dict],
         f"Tonausgabe:     {player_info.get('device', '?')}, gemeldete Latenz "
         f"{player_info.get('latency_ms', '?')} ms, Zeitpunkte aus DAC-Zeit: "
         f"{player_info.get('dac_beeps', '?')}",
-        "",
     ]
+    for err in player_info.get("errors") or []:
+        lines.append(f"   nicht genutzt: {err}")
+    lines += [""]
     for i, r in enumerate(runs, 1):
         head = f"Durchlauf {i}: Versatz angewendet {int(r.get('applied_ms', 0)):+d} ms -> "
         if r.get("ok"):
@@ -689,6 +737,7 @@ class CalibrationThread(threading.Thread):
             "device": getattr(player, "device_info", ""),
             "latency_ms": int(round(getattr(player, "latency_s", 0.0) * 1000)),
             "dac_beeps": getattr(player, "dac_beeps", 0),
+            "errors": list(getattr(player, "errors", [])),
         }
         with self._lock:
             self._player = None

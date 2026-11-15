@@ -120,6 +120,7 @@ class MainWindow(ctk.CTk):
         self._calib_thread: CalibrationThread | None = None
         self._flash_window = None
         self._flash_frame = None
+        self._flash_delays: list[float] = []
         # Sync-Marker (siehe syncfix.py)
         self._marker_thread: MarkerThread | None = None
         self._syncfix_thread: SyncFixThread | None = None
@@ -1459,6 +1460,13 @@ class MainWindow(ctk.CTk):
         win.update_idletasks()
         self._flash_window, self._flash_frame = win, flash
 
+    def _flash_timing_note(self) -> str:
+        d = list(getattr(self, "_flash_delays", []) or [])
+        if not d:
+            return "Blinken gezeichnet: keine Messwerte"
+        return (f"Blinken gezeichnet: im Mittel {sum(d) / len(d):+.0f} ms, höchstens "
+                f"{max(d):+.0f} ms nach dem geplanten Zeitpunkt ({len(d)} Blitze)")
+
     def _close_flash_window(self):
         win = getattr(self, "_flash_window", None)
         self._flash_window, self._flash_frame = None, None
@@ -1479,6 +1487,8 @@ class MainWindow(ctk.CTk):
             try:
                 frame.configure(bg="white")
                 frame.update_idletasks()
+                # Kontrolle: wie viel später als geplant wurde gezeichnet?
+                self._flash_delays.append((time.perf_counter() - due) * 1000.0)
             except Exception:
                 pass
 
@@ -1531,6 +1541,7 @@ class MainWindow(ctk.CTk):
             return
 
         self._pause_meters()
+        self._flash_delays = []
         self._open_flash_window(plan, "Ton wird kalibriert – bitte nicht verdecken")
         for btn in (self.calib_btn, self.bench_btn, self.start_btn):
             btn.configure(state="disabled")
@@ -1570,6 +1581,8 @@ class MainWindow(ctk.CTk):
 
     def _calib_finish(self, result: dict):
         self._close_calibration()
+        if result.get("log_path"):
+            self._append_recording_log(result["log_path"], self._flash_timing_note())
         ident = getattr(self, "_calib_ident", None)
         log_hint = (f"\n\nProtokoll: {os.path.basename(result['log_path'])}"
                     if result.get("log_path") else "")
@@ -1644,6 +1657,7 @@ class MainWindow(ctk.CTk):
         plan = self._marker_plan
         if not plan or self._closing:
             return
+        self._flash_delays = []
         self._open_flash_window(plan, "Sync-Marker – bitte kurz warten")
         self._marker_thread = MarkerThread(
             on_flash=lambda due: self._post_to_gui(self._flash_at, due),
@@ -1923,9 +1937,12 @@ class MainWindow(ctk.CTk):
         if not self._marker_end_s:
             why = info.get("error") or "Aufnahme vor Ende des Markers gestoppt"
             return f"Sync-Marker:    nicht vollständig abgespielt ({why}) – keine Korrektur"
-        return (f"Sync-Marker:    abgespielt über {info.get('device') or '?'} "
+        note = (f"Sync-Marker:    abgespielt über {info.get('device') or '?'} "
                 f"(gemeldete Latenz {info.get('latency_ms')} ms), Ende bei "
-                f"{self._marker_end_s:.2f} s")
+                f"{self._marker_end_s:.2f} s\n                {self._flash_timing_note()}")
+        for err in info.get("errors") or []:
+            note += f"\n                nicht genutzt: {err}"
+        return note
 
     def _finish_saved(self, path: str, elapsed: float, log_path, requested_fps: float,
                       audio_offset_ms: int, fix_result: dict | None = None):

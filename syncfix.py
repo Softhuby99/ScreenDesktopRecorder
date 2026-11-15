@@ -135,7 +135,7 @@ class MarkerThread(threading.Thread):
         self.cancel()
 
     def run(self):
-        info = {"ok": False, "error": "", "device": "", "latency_ms": None}
+        info = {"ok": False, "error": "", "device": "", "latency_ms": None, "errors": []}
         try:
             if self._cancelled.wait(MARKER_LEAD_S):
                 raise InterruptedError
@@ -150,7 +150,8 @@ class MarkerThread(threading.Thread):
             play_signal(player, self._cancelled, MARKER_BEEPS, MARKER_INTERVAL_S)
             info.update(ok=not self._cancelled.is_set(),
                         device=getattr(player, "device_info", ""),
-                        latency_ms=int(round(getattr(player, "latency_s", 0.0) * 1000)))
+                        latency_ms=int(round(getattr(player, "latency_s", 0.0) * 1000)),
+                        errors=list(getattr(player, "errors", [])))
         except InterruptedError:
             info["error"] = "abgebrochen"
         except Exception as exc:

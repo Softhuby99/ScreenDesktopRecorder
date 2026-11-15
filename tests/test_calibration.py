@@ -285,5 +285,84 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(t.is_alive())
 
 
+class OutputFormatTest(unittest.TestCase):
+    def test_stereo_pcm_is_interleaved(self):
+        import array
+        mono, stereo = array.array("h"), array.array("h")
+        mono.frombytes(c.make_beep_pcm(rate=8000, beeps=2, interval=1.0))
+        stereo.frombytes(c.make_beep_pcm(rate=8000, beeps=2, interval=1.0, channels=2))
+        self.assertEqual(len(stereo), 2 * len(mono))
+        self.assertEqual(list(stereo[0::2]), list(mono))
+        self.assertEqual(list(stereo[1::2]), list(mono))
+
+    def _fake_sd(self, wasapi_settings_ok=True):
+        sd = mock.MagicMock()
+        apis = [{"name": "MME", "default_output_device": 3},
+                {"name": "Windows WASAPI", "default_output_device": 7}]
+        sd.query_hostapis.side_effect = lambda i=None: apis if i is None else apis[i]
+
+        def query_devices(dev=None, kind=None):
+            if dev == 7:
+                return {"name": "Lautsprecher", "default_samplerate": 44100.0,
+                        "max_output_channels": 2, "hostapi": 1}
+            return {"name": "Lautsprecher (MME)", "default_samplerate": 44100.0,
+                    "max_output_channels": 2, "hostapi": 0}
+        sd.query_devices.side_effect = query_devices
+        if not wasapi_settings_ok:
+            sd.WasapiSettings.side_effect = TypeError("unexpected keyword 'auto_convert'")
+        return sd
+
+    def test_attempts_use_device_format_first(self):
+        sd = self._fake_sd()
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            attempts = c.BeepPlayer.output_attempts(sd)
+        self.assertEqual(attempts[0][:3], (7, 44100, 2))
+        self.assertEqual(attempts[0][4], "WASAPI")
+        self.assertEqual(attempts[1][1:3], (48000, 1))
+        self.assertEqual(attempts[2][0], None)
+
+    def test_missing_auto_convert_is_reported(self):
+        sd = self._fake_sd(wasapi_settings_ok=False)
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            attempts = c.BeepPlayer.output_attempts(sd)
+        self.assertEqual(attempts[1][0], "skip")
+        self.assertIn("auto_convert", attempts[1][4])
+
+    def test_failed_wasapi_falls_back_and_logs_reason(self):
+        sd = self._fake_sd()
+        opened = []
+
+        def raw_stream(**kw):
+            if kw["device"] == 7:
+                raise RuntimeError("Invalid sample rate [PaErrorCode -9997]")
+            opened.append(kw)
+            st = mock.MagicMock()
+            st.latency = 0.09
+            st.device = 3
+            return st
+        sd.RawOutputStream.side_effect = raw_stream
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            p = c.BeepPlayer(lambda due: None)
+            p.start()
+        self.assertEqual(opened[0]["channels"], 2)
+        self.assertEqual(opened[0]["samplerate"], 44100)
+        self.assertEqual(len(p.errors), 2)
+        self.assertIn("-9997", p.errors[0])
+        self.assertIn("MME", p.device_info)
+
+    def test_callback_stereo_and_dac_time(self):
+        sd = self._fake_sd()
+        beeps = []
+        with mock.patch.dict("sys.modules", {"sounddevice": sd}):
+            p = c.BeepPlayer(beeps.append, beeps=2, interval=1.0)
+            p._prepare(8000, 2)
+            out = bytearray(2 * 2 * 4000)
+            ti = mock.Mock(outputBufferDacTime=10.05, currentTime=10.0)
+            p._callback(out, 4000, ti, None)    # erster Ton bei Frame 2400
+        self.assertEqual(len(beeps), 1)
+        self.assertEqual(p.dac_beeps, 1)
+        self.assertEqual(bytes(out), p._pcm[:len(out)])
+
+
 if __name__ == "__main__":
     unittest.main()
