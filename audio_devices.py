@@ -191,6 +191,52 @@ def list_sounddevice_inputs() -> list[tuple[str, str]]:
     return unique
 
 
+def default_output_device_name() -> str | None:
+    """
+    Name des Standard-Ausgabegeräts (Lautsprecher/Kopfhörer) für das
+    Aufnahme-Log. Unter Windows bevorzugt über WASAPI, weil MME die Namen
+    auf 31 Zeichen kürzt. PortAudio liest die Geräteliste nur beim Start
+    ein: Ein später in Windows umgestelltes Standardgerät sieht es nicht.
+    Liefert None, wenn sounddevice fehlt oder nichts ermittelbar ist.
+    """
+    try:
+        import sounddevice as sd
+    except Exception:
+        return None
+    try:
+        for api in sd.query_hostapis():
+            index = api.get("default_output_device", -1)
+            if "WASAPI" in str(api.get("name", "")) and index is not None and index >= 0:
+                return str(sd.query_devices(index)["name"]).strip() or None
+        return str(sd.query_devices(kind="output")["name"]).strip() or None
+    except Exception:
+        return None
+
+
+def audio_inputs_from_command(command: list | None) -> list[str]:
+    """
+    Liest die Ton-Eingänge aus einem FFmpeg-Kommando: das Argument von
+    -i nach "-f dshow" / "-f pulse" / "-f alsa" / "-f wasapi". Bei dshow
+    wird das Präfix "audio=" entfernt. Bild-Eingänge (lavfi, x11grab,
+    gdigrab) werden übergangen.
+    """
+    audio_formats = {"dshow", "pulse", "alsa", "wasapi"}
+    found: list[str] = []
+    fmt = None
+    args = list(command or [])
+    for i, arg in enumerate(args):
+        if arg == "-f" and i + 1 < len(args):
+            fmt = args[i + 1]
+        elif arg == "-i" and i + 1 < len(args):
+            if fmt in audio_formats:
+                value = str(args[i + 1])
+                if value.startswith("audio="):
+                    value = value[len("audio="):]
+                found.append(value)
+            fmt = None
+    return found
+
+
 # ============================================================================
 # 4) ÖFFENTLICHE API
 # ============================================================================

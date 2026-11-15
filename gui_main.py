@@ -30,6 +30,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 
 from audio_devices import (
+    audio_inputs_from_command, default_output_device_name,
     find_meter_devices_for, get_audio_sources, guess_microphone_default,
     guess_speaker_monitor_default, list_meter_devices, looks_like_system_audio,
 )
@@ -1388,6 +1389,9 @@ class MainWindow(ctk.CTk):
         # Audioquelle zu öffnen (siehe _pause_meters).
         self._pause_meters()
 
+        # Standard-Ausgabegerät zum Aufnahmestart festhalten (fürs Log).
+        self._rec_output_device = default_output_device_name()
+
         self.recorder = RecorderThread(
             settings,
             on_started=lambda: self._post_to_gui(self._on_recording_started),
@@ -1605,6 +1609,10 @@ class MainWindow(ctk.CTk):
                 f.write(f"Aufnahmedauer:  {elapsed_seconds:.1f}s\n")
                 f.write(f"Datei:          {os.path.basename(video_path)} ({size_info})\n")
                 f.write(f"Aufnahmeverfahren: {self._capture_method_from(command)}\n")
+                inputs = audio_inputs_from_command(command)
+                f.write(f"Mikrofon/Tonquelle: {' + '.join(inputs) if inputs else 'kein Ton'}\n")
+                output = getattr(self, "_rec_output_device", None)
+                f.write(f"Ausgabegerät:   {output or 'nicht ermittelbar'} (Standardgerät beim Start)\n")
                 f.write("\nFFmpeg-Kommando:\n")
                 f.write("-" * 60 + "\n")
                 f.write(" ".join(command) if command else "(nicht erfasst)")
