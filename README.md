@@ -103,9 +103,17 @@ Desktop-Apps sperrt), warnt die App mit den möglichen Ursachen.
 **Ton/Bild-Zeitstempel:** Die Aufnahme verwendet die nativen Zeitstempel
 (Basis der erfolgreichen Testvariante B02). Die fehlerhafte Wallclock-/copyts-
 Kombination und die heuristische Verwerfung/Verschiebung von Audiobloecken
-wurden entfernt. Ein verbleibender Start-/Geraeteversatz ist damit noch nicht
-automatisch korrigiert. Im Audio-Tab steht dafuer **Ton-Versatz** (±500 ms)
-zur Verfuegung: negativ = Ton frueher, positiv = Ton spaeter.
+wurden entfernt. Unter Windows nutzt der Mikrofoneingang
+`-audio_buffer_size 20`; das senkte die Tonverspaetung in Messungen von
+ca. 600 ms auf ca. 150-200 ms (je nach Mikrofon). Den Rest gleicht der
+**Ton-Versatz** (±1000 ms, negativ = Ton frueher) aus. Er gilt je Mikrofon.
+
+**Ton kalibrieren (Windows):** Der Knopf im Audio-Tab misst den Versatz fuer
+das gewaehlte Mikrofon: Ein kleines Fenster blinkt 6x, dazu kommen Piepstoene
+ueber die Lautsprecher; aufgenommen wird mit derselben Kette wie bei einer
+echten Aufnahme. Das Ergebnis wird je Mikrofon gespeichert und bei jeder
+Aufnahme angewendet. Voraussetzung: Lautsprecher an, kein geschlossener
+Kopfhoerer. Details: `plan-kalibrierung.md`.
 
 **Aufnahmepruefung:** Nach dem Stoppen prueft FFmpeg die angeforderten Spuren
 und dekodiert den Anfang. Fehlende Spuren, unlesbare Dateien und bekannte

@@ -191,14 +191,97 @@ def list_sounddevice_inputs() -> list[tuple[str, str]]:
     return unique
 
 
+_MMDEV_RENDER = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+_PKEY_DEVICE_DESC = "{a45c254e-df1c-4efd-8020-67d146a850e0},2"   # z. B. "Lautsprecher"
+_PKEY_INTERFACE = "{b3f8fa53-0004-438e-9003-51a46e139bfc},6"     # z. B. "Realtek(R) Audio"
+
+
+def pick_default_render(endpoints: list[dict]) -> str | None:
+    """
+    Wählt aus den Wiedergabe-Endpunkten das Standardgerät: aktiv
+    (DeviceState 1) und mit dem jüngsten "Role:0"-Zeitstempel - den setzt
+    Windows bei jedem Wechsel des Standardgeräts. Liefert den Namen so,
+    wie Windows ihn anzeigt: "Beschreibung (Schnittstelle)".
+    GUI- und Windows-frei, damit testbar.
+    """
+    best = None
+    for ep in endpoints:
+        if ep.get("state") != 1 or not ep.get("role0"):
+            continue
+        if best is None or ep["role0"] > best["role0"]:
+            best = ep
+    if best is None:
+        return None
+    desc = (best.get("desc") or "").strip()
+    iface = (best.get("iface") or "").strip()
+    if desc and iface:
+        return f"{desc} ({iface})"
+    return desc or iface or None
+
+
+def _windows_default_render_name() -> str | None:
+    """
+    Liest das aktuelle Windows-Standard-Wiedergabegerät aus der Registry
+    (MMDevices). Anders als PortAudio/sounddevice, das die Geräteliste nur
+    beim Programmstart einliest, ist das hier immer der aktuelle Stand.
+    """
+    try:
+        import winreg
+    except Exception:
+        return None
+    endpoints = []
+    try:
+        root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _MMDEV_RENDER)
+    except OSError:
+        return None
+    with root:
+        i = 0
+        while True:
+            try:
+                guid = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            ep = {}
+            try:
+                with winreg.OpenKey(root, guid) as key:
+                    ep["state"] = winreg.QueryValueEx(key, "DeviceState")[0]
+                    try:
+                        ep["role0"] = bytes(winreg.QueryValueEx(key, "Role:0")[0])
+                    except OSError:
+                        ep["role0"] = None
+                with winreg.OpenKey(root, guid + r"\Properties") as props:
+                    for field, name in (("desc", _PKEY_DEVICE_DESC), ("iface", _PKEY_INTERFACE)):
+                        try:
+                            ep[field] = str(winreg.QueryValueEx(props, name)[0])
+                        except OSError:
+                            ep[field] = ""
+            except OSError:
+                continue
+            # SYSTEMTIME (16 Byte, little endian) -> vergleichbares Tupel
+            raw = ep.get("role0")
+            if raw and len(raw) >= 16:
+                import struct
+                y, mo, _dow, d, h, mi, s, ms = struct.unpack("<8H", raw[:16])
+                ep["role0"] = (y, mo, d, h, mi, s, ms)
+            else:
+                ep["role0"] = None
+            endpoints.append(ep)
+    return pick_default_render(endpoints)
+
+
 def default_output_device_name() -> str | None:
     """
     Name des Standard-Ausgabegeräts (Lautsprecher/Kopfhörer) für das
-    Aufnahme-Log. Unter Windows bevorzugt über WASAPI, weil MME die Namen
-    auf 31 Zeichen kürzt. PortAudio liest die Geräteliste nur beim Start
-    ein: Ein später in Windows umgestelltes Standardgerät sieht es nicht.
-    Liefert None, wenn sounddevice fehlt oder nichts ermittelbar ist.
+    Aufnahme-Log. Unter Windows zuerst aktuell aus der Registry, sonst über
+    sounddevice (WASAPI bevorzugt, weil MME Namen auf 31 Zeichen kürzt;
+    PortAudio kennt aber nur den Stand beim Programmstart).
+    Liefert None, wenn nichts ermittelbar ist.
     """
+    if IS_WINDOWS:
+        name = _windows_default_render_name()
+        if name:
+            return name
     try:
         import sounddevice as sd
     except Exception:

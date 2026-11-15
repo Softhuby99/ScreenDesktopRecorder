@@ -35,6 +35,10 @@ from audio_devices import (
     guess_speaker_monitor_default, list_meter_devices, looks_like_system_audio,
 )
 from audio_meter import LevelMeter
+from calibration import (
+    CALIB_FLASH_S, SOURCE_CALIBRATED, SOURCE_MANUAL, CalibrationThread,
+    offset_note, remember_offset, stored_offset,
+)
 from benchmark import BenchmarkThread
 from config import (
     APP_NAME, APP_VERSION, AUDIO_OFFSET_MAX_MS, AUDIO_OFFSET_MIN_MS, AUDIO_OFFSET_STEPS,
@@ -111,6 +115,10 @@ class MainWindow(ctk.CTk):
         self.mini_panel: MiniPanel | None = None
         self.benchmark_thread: BenchmarkThread | None = None
         self._diagnosis_thread: DiagnosisThread | None = None
+        # Ton-Kalibrierung (siehe calibration.py)
+        self._calib_thread: CalibrationThread | None = None
+        self._calib_window = None
+        self._calib_flash_frame = None
         self._timer_job = None
         self._region_job = None
         self._blink_state = True
@@ -141,6 +149,18 @@ class MainWindow(ctk.CTk):
         # geladen ist (_apply_audio_devices) - bis dahin darf ein Speichern
         # die gemerkte Quelle nicht mit "Kein Audio" ueberschreiben.
         self._saved_settings: dict = load_settings()
+        # Ton-Versatz je Mikrofon: {FFmpeg-ID: {ms, source, date}}
+        self._audio_offsets: dict = dict(self._saved_settings.get("audio_offsets") or {})
+        _legacy_dev = self._saved_settings.get("audio_device")
+        try:
+            _legacy_ms = int(self._saved_settings.get("audio_offset_ms", 0) or 0)
+        except (TypeError, ValueError):
+            _legacy_ms = 0
+        if _legacy_dev and _legacy_ms and _legacy_dev not in self._audio_offsets:
+            # Frueher gab es nur einen globalen Wert: dem zuletzt genutzten
+            # Mikrofon zuordnen, damit nichts verloren geht.
+            self._audio_offsets = remember_offset(
+                self._audio_offsets, _legacy_dev, _legacy_ms, SOURCE_MANUAL)
         self._audio_devices_loaded = False
 
         self._build_ui()
@@ -507,10 +527,29 @@ class MainWindow(ctk.CTk):
             mic_card,
             text="Nur bei Videoaufnahmen. Kommt der Ton im Video zu spät "
                  "(z. B. bei Bluetooth-Headsets), nach links schieben – "
-                 "zu früh: nach rechts. Normalerweise 0 lassen.",
+                 "zu früh: nach rechts. Am besten über „Ton kalibrieren“ "
+                 "messen lassen; der Wert gilt je Mikrofon.",
             font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
             anchor="w", wraplength=410, justify="left",
         ).pack(fill="x", padx=14)
+
+        calib_row = ctk.CTkFrame(mic_card, fg_color="transparent")
+        calib_row.pack(fill="x", padx=14, pady=(8, 0))
+        self.calib_btn = ctk.CTkButton(
+            calib_row, text="🎯  Ton kalibrieren", width=150, height=30,
+            font=("Segoe UI", 12), corner_radius=8,
+            fg_color=COLOR_BG_INPUT, hover_color=COLOR_ACCENT_HOVER,
+            command=self._start_calibration,
+        )
+        self.calib_btn.pack(side="left")
+        self.offset_note_label = ctk.CTkLabel(
+            calib_row, text="nicht kalibriert", font=("Segoe UI", 11),
+            text_color=COLOR_TEXT_MUTED, anchor="w",
+        )
+        self.offset_note_label.pack(side="left", padx=(10, 0))
+        if not IS_WINDOWS:
+            self.calib_btn.configure(state="disabled")
+            self.offset_note_label.configure(text="Kalibrierung nur unter Windows")
 
         self.denoise_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(
@@ -661,7 +700,7 @@ class MainWindow(ctk.CTk):
             offset = int(s.get("audio_offset_ms", 0))
             offset = max(AUDIO_OFFSET_MIN_MS, min(AUDIO_OFFSET_MAX_MS, offset))
             self.audio_offset_var.set(offset)
-            self._on_audio_offset_change(offset)
+            self._update_offset_label(offset)
         except (TypeError, ValueError):
             pass
 
@@ -692,6 +731,7 @@ class MainWindow(ctk.CTk):
             "mic_gain": round(float(self.mic_gain_var.get()), 3),
             "denoise": bool(self.denoise_var.get()),
             "audio_offset_ms": self._audio_offset_ms(),
+            "audio_offsets": self._audio_offsets,
         })
         if self._audio_devices_loaded:
             label = self.audio_var.get()
@@ -902,6 +942,8 @@ class MainWindow(ctk.CTk):
 
         label = self.audio_var.get()
         ident = self.audio_map.get(label) if label != NO_AUDIO_LABEL else None
+        if self._audio_devices_loaded:
+            self._apply_stored_offset(ident)
 
         # 1) Genau das Geraet zeigen, das auch aufgenommen wird.
         #    Frueher wurde hier unabhaengig von der Auswahl immer das erste
@@ -954,9 +996,39 @@ class MainWindow(ctk.CTk):
     def _on_gain_change(self, value):
         self.mic_gain_label.configure(text=f"{float(value):.1f}×")
 
-    def _on_audio_offset_change(self, value):
+    def _update_offset_label(self, value):
         ms = int(round(float(value) / 10.0) * 10)
         self.audio_offset_label.configure(text=f"{ms:+d} ms" if ms else "0 ms")
+
+    def _on_audio_offset_change(self, value):
+        """Nur bei Bedienung durch den Nutzer: Wert gilt fuer dieses Mikrofon."""
+        self._update_offset_label(value)
+        ident = self._current_audio_ident()
+        if ident:
+            ms = int(round(float(value) / 10.0) * 10)
+            self._audio_offsets = remember_offset(self._audio_offsets, ident, ms, SOURCE_MANUAL)
+            self._show_offset_note(ident)
+
+    def _current_audio_ident(self) -> str | None:
+        label = self.audio_var.get()
+        if label == NO_AUDIO_LABEL:
+            return None
+        return self.audio_map.get(label)
+
+    def _show_offset_note(self, ident: str | None):
+        if not IS_WINDOWS:
+            return
+        self.offset_note_label.configure(
+            text=offset_note(stored_offset(self._audio_offsets, ident)) if ident else "kein Mikrofon gewählt"
+        )
+
+    def _apply_stored_offset(self, ident: str | None):
+        """Mikrofonwechsel: gespeicherten Versatz dieses Mikrofons laden (sonst 0)."""
+        entry = stored_offset(self._audio_offsets, ident)
+        ms = entry["ms"] if entry else 0
+        self.audio_offset_var.set(ms)
+        self._update_offset_label(ms)
+        self._show_offset_note(ident)
 
     def _start_mic_meter(self, index: int | None):
         if self._mic_level_meter:
@@ -1260,7 +1332,7 @@ class MainWindow(ctk.CTk):
     # BENCHMARK
     # ==================================================================
     def _start_benchmark(self):
-        if self._closing:
+        if self._closing or self._calibrating():
             return
         self.bench_btn.configure(state="disabled", text="⏳  Test läuft ...")
         self.start_btn.configure(state="disabled")
@@ -1306,6 +1378,157 @@ class MainWindow(ctk.CTk):
         self.start_btn.configure(state="normal")
 
     # ==================================================================
+    # TON KALIBRIEREN (siehe calibration.py / plan-kalibrierung.md)
+    # ==================================================================
+    CALIB_WIN_W, CALIB_WIN_H = 360, 250       # Kalibrierfenster
+    CALIB_FLASH_W, CALIB_FLASH_H = 300, 180   # blitzender Bereich darin
+
+    def _calibrating(self) -> bool:
+        t = self._calib_thread
+        return t is not None and t.is_alive()
+
+    def _start_calibration(self):
+        if self._closing or self._calibrating() or self.recorder is not None:
+            return
+        if self.benchmark_thread is not None and self.benchmark_thread.is_alive():
+            return
+        label = self.audio_var.get()
+        ident = self._current_audio_ident()
+        if not ident:
+            messagebox.showinfo("Ton kalibrieren",
+                                "Bitte zuerst ein Mikrofon als Tonquelle wählen.")
+            return
+        if looks_like_system_audio(label):
+            messagebox.showinfo("Ton kalibrieren",
+                                "Die Kalibrierung ist für Mikrofone gedacht. Beim Systemton "
+                                "ist keine Korrektur nötig.")
+            return
+        if not messagebox.askokcancel(
+            "Ton kalibrieren",
+            f"Gemessen wird für:\n{label}\n\n"
+            "• Lautsprecher einschalten (kein geschlossener Kopfhörer)\n"
+            "• Lautstärke mittel\n"
+            "• etwa 20 Sekunden ruhig sein\n\n"
+            "Ein kleines Fenster blinkt dabei mehrmals, dazu ertönen Pieptöne.",
+        ):
+            return
+
+        self._pause_meters()
+        region = self._open_calibration_window()
+        for btn in (self.calib_btn, self.bench_btn, self.start_btn):
+            btn.configure(state="disabled")
+        self.offset_note_label.configure(text="Messung wird vorbereitet ...")
+        self._calib_ident = ident
+        self._calib_thread = CalibrationThread(
+            audio_device=ident, region=region, fps=self.fps_var.get(),
+            screen_size=self._current_screen_size(),
+            on_flash=lambda due: self._post_to_gui(self._calib_flash, due),
+            on_progress=lambda t: self._post_to_gui(self._calib_progress, t),
+            on_finish=lambda r: self._post_to_gui(self._calib_finish, r),
+            on_error=lambda m: self._post_to_gui(self._calib_error, m),
+        )
+        self._calib_thread.start()
+
+    def _open_calibration_window(self) -> tuple[int, int, int, int]:
+        """
+        Kleines schwarzes Fenster mittig auf dem Hauptbildschirm (dort
+        arbeitet ddagrab). Liefert den aufzunehmenden Bereich: nur das
+        blitzende Feld, mit etwas Rand, damit Kanten nicht mitzählen.
+        """
+        import tkinter as tk
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = max(0, (sw - self.CALIB_WIN_W) // 2)
+        y = max(0, (sh - self.CALIB_WIN_H) // 2)
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg="#202020")
+        win.geometry(f"{self.CALIB_WIN_W}x{self.CALIB_WIN_H}+{x}+{y}")
+        fx = (self.CALIB_WIN_W - self.CALIB_FLASH_W) // 2
+        flash = tk.Frame(win, bg="black", width=self.CALIB_FLASH_W, height=self.CALIB_FLASH_H)
+        flash.place(x=fx, y=15)
+        tk.Label(win, text="Ton wird kalibriert – bitte nicht verdecken",
+                 bg="#202020", fg="#bbbbbb", font=("Segoe UI", 10)).place(
+                     x=0, y=15 + self.CALIB_FLASH_H + 12, width=self.CALIB_WIN_W)
+        win.update_idletasks()
+        self._calib_window, self._calib_flash_frame = win, flash
+        inset = 8
+        return (x + fx + inset, y + 15 + inset,
+                self.CALIB_FLASH_W - 2 * inset, self.CALIB_FLASH_H - 2 * inset)
+
+    def _calib_flash(self, due: float):
+        frame = self._calib_flash_frame
+        if frame is None:
+            return
+        delay_ms = max(0, int(round((due - time.perf_counter()) * 1000)))
+
+        def on():
+            try:
+                frame.configure(bg="white")
+                frame.update_idletasks()
+            except Exception:
+                pass
+
+        def off():
+            try:
+                frame.configure(bg="black")
+            except Exception:
+                pass
+
+        self.after(delay_ms, on)
+        self.after(delay_ms + int(CALIB_FLASH_S * 1000), off)
+
+    def _calib_progress(self, text: str):
+        self.offset_note_label.configure(text=text)
+
+    def _close_calibration(self):
+        win, self._calib_window, self._calib_flash_frame = self._calib_window, None, None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        for btn in (self.bench_btn, self.start_btn):
+            btn.configure(state="normal")
+        if IS_WINDOWS:
+            self.calib_btn.configure(state="normal")
+        try:
+            self._resume_meters()
+        except Exception:
+            pass
+
+    def _calib_finish(self, result: dict):
+        self._close_calibration()
+        ident = getattr(self, "_calib_ident", None)
+        if not result.get("ok"):
+            self._show_offset_note(self._current_audio_ident())
+            messagebox.showwarning("Kalibrierung nicht möglich",
+                                   result.get("reason") or "Unbekannter Fehler.")
+            return
+        ms = int(result["correction_ms"])
+        late = int(result["lateness_ms"])
+        self._audio_offsets = remember_offset(self._audio_offsets, ident, ms, SOURCE_CALIBRATED)
+        if ident == self._current_audio_ident():
+            self._apply_stored_offset(ident)
+        self._save_settings()
+        if late > 0:
+            what = f"Der Ton kam {late} ms zu spät."
+        elif late < 0:
+            what = f"Der Ton kam {-late} ms zu früh."
+        else:
+            what = "Ton und Bild waren bereits synchron."
+        messagebox.showinfo(
+            "Kalibrierung abgeschlossen",
+            f"{what}\nTon-Versatz auf {ms:+d} ms gesetzt und für dieses Mikrofon "
+            f"gespeichert.\n\n({result['pairs']} Messpunkte, Streuung {result['spread_ms']} ms)",
+        )
+
+    def _calib_error(self, message: str):
+        self._close_calibration()
+        self._show_offset_note(self._current_audio_ident())
+        messagebox.showerror("Kalibrierung fehlgeschlagen", message)
+
+    # ==================================================================
     # AUFNAHME
     # ==================================================================
     def _start_recording(self):
@@ -1314,7 +1537,7 @@ class MainWindow(ctk.CTk):
         # kommt asynchron erst nach dem Prozessstart), einen zweiten,
         # verwaisten RecorderThread/FFmpeg-Prozess samt zweitem MiniPanel
         # erzeugen. self.recorder ist nur zwischen Start und Stop gesetzt.
-        if self._closing:
+        if self._closing or self._calibrating():
             return
         if self.recorder is not None:
             return
@@ -1391,6 +1614,12 @@ class MainWindow(ctk.CTk):
 
         # Standard-Ausgabegerät zum Aufnahmestart festhalten (fürs Log).
         self._rec_output_device = default_output_device_name()
+        offset_ms = self._audio_offset_ms()
+        entry = stored_offset(self._audio_offsets, audio_device)
+        self._rec_offset_note = (
+            f"{offset_ms:+d} ms ({offset_note(entry)})" if entry and entry["ms"] == offset_ms
+            else f"{offset_ms:+d} ms"
+        ) if offset_ms else "0 ms"
 
         self.recorder = RecorderThread(
             settings,
@@ -1612,7 +1841,8 @@ class MainWindow(ctk.CTk):
                 inputs = audio_inputs_from_command(command)
                 f.write(f"Mikrofon/Tonquelle: {' + '.join(inputs) if inputs else 'kein Ton'}\n")
                 output = getattr(self, "_rec_output_device", None)
-                f.write(f"Ausgabegerät:   {output or 'nicht ermittelbar'} (Standardgerät beim Start)\n")
+                f.write(f"Ausgabegerät:   {output or 'nicht ermittelbar'} (Windows-Standardgerät beim Aufnahmestart)\n")
+                f.write(f"Ton-Versatz:    {getattr(self, '_rec_offset_note', '0 ms')}\n")
                 f.write("\nFFmpeg-Kommando:\n")
                 f.write("-" * 60 + "\n")
                 f.write(" ".join(command) if command else "(nicht erfasst)")
@@ -2023,7 +2253,8 @@ class MainWindow(ctk.CTk):
             # abbrechen; die unfertige Ausgabedatei räumt OptimizeThread
             # selbst auf.
             wait_for_workers(
-                [self.benchmark_thread, self._optimize_thread, self._diagnosis_thread],
+                [self.benchmark_thread, self._optimize_thread, self._diagnosis_thread,
+                 getattr(self, "_calib_thread", None)],
                 pump=self._pump_events,
             )
         finally:
