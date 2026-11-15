@@ -21,6 +21,15 @@ jobs:
       - name: Repo auschecken
         uses: actions/checkout@v4
 
+      # Build-Stempel: Zeitpunkt (UTC) + Commit, damit sich an Fenstertitel
+      # und Aufnahme-Log immer erkennen laesst, welcher Stand laeuft.
+      - name: Build-Stempel schreiben
+        shell: bash
+        run: |
+          STAMP="$(date -u '+%Y-%m-%d %H:%M UTC') | ${GITHUB_SHA::7}"
+          printf '"""build_info.py - im Build von GitHub Actions erzeugt."""\n\nBUILD_STAMP = "%s"\n' "$STAMP" > build_info.py
+          cat build_info.py
+
       - name: Python einrichten
         uses: actions/setup-python@v5
         with:
@@ -76,6 +85,15 @@ jobs:
     steps:
       - name: Repo auschecken
         uses: actions/checkout@v4
+
+      # Build-Stempel: Zeitpunkt (UTC) + Commit, damit sich an Fenstertitel
+      # und Aufnahme-Log immer erkennen laesst, welcher Stand laeuft.
+      - name: Build-Stempel schreiben
+        shell: bash
+        run: |
+          STAMP="$(date -u '+%Y-%m-%d %H:%M UTC') | ${GITHUB_SHA::7}"
+          printf '"""build_info.py - im Build von GitHub Actions erzeugt."""\n\nBUILD_STAMP = "%s"\n' "$STAMP" > build_info.py
+          cat build_info.py
 
       # Bewusst das System-Python von Ubuntu (nicht actions/setup-python):
       # Nur dieses hat per 'python3-tk' das Modul tkinter. Mit dem
