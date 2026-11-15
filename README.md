@@ -109,11 +109,22 @@ ca. 600 ms auf ca. 150-200 ms (je nach Mikrofon). Den Rest gleicht der
 **Ton-Versatz** (±1000 ms, negativ = Ton frueher) aus. Er gilt je Mikrofon.
 
 **Ton kalibrieren (Windows):** Der Knopf im Audio-Tab misst den Versatz fuer
-das gewaehlte Mikrofon: Ein kleines Fenster blinkt 6x, dazu kommen Piepstoene
-ueber die Lautsprecher; aufgenommen wird mit derselben Kette wie bei einer
-echten Aufnahme. Das Ergebnis wird je Mikrofon gespeichert und bei jeder
-Aufnahme angewendet. Voraussetzung: Lautsprecher an, kein geschlossener
-Kopfhoerer. Details: `plan-kalibrierung.md`.
+das gewaehlte Mikrofon - mit denselben Einstellungen wie eine echte Aufnahme
+(Bereich, Bildrate, Encoder, Preset). Drei Durchlaeufe mit Gegenprobe: ein
+Feld blinkt je 5x, dazu Piepstoene ueber die Lautsprecher. Ist das Geraet
+stabil, wird der Wert je Mikrofon gespeichert und bei jeder Aufnahme
+angewendet. Schwankt es zwischen den Durchlaeufen um mehr als 60 ms, meldet
+die App das und bietet den Sync-Marker an. Jede Kalibrierung schreibt ein
+Protokoll `Kalibrierung_<Zeit>_log.txt` in den Speicherordner (bei Fehlschlag
+oder Schwankung zusaetzlich die Messaufnahmen).
+
+**Sync-Marker (Windows, je Mikrofon):** Fuer Mikrofone mit schwankender
+Verzoegerung. Zu Beginn jeder Aufnahme blinkt ca. 6 s lang ein Feld im
+Aufnahmebereich, dazu Piepstoene. Nach dem Stoppen misst die App den Versatz
+genau in dieser Datei, schneidet den Anfang samt Marker ab (am naechsten
+Schluesselbild, das Bild wird nicht neu kodiert) und legt den Ton exakt
+darunter (Ton neu als AAC). Gelingt das nicht, bleibt die Datei unveraendert;
+das Aufnahme-Log nennt den Grund.
 
 **Aufnahmepruefung:** Nach dem Stoppen prueft FFmpeg die angeforderten Spuren
 und dekodiert den Anfang. Fehlende Spuren, unlesbare Dateien und bekannte

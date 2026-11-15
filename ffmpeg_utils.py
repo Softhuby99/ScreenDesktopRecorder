@@ -41,6 +41,10 @@ from platform_utils import (
 # ============================================================================
 # 1) RESSOURCEN- UND FFMPEG-PFADAUFLÖSUNG
 # ============================================================================
+# Sync-Marker: so lange am Aufnahmeanfang dichte Schlüsselbilder (siehe syncfix.py)
+MARKER_KEYFRAME_WINDOW_S = 30
+
+
 def resource_path(relative_path: str) -> str:
     """
     Löst einen Pfad relativ zum Anwendungsverzeichnis auf.
@@ -606,9 +610,15 @@ def build_record_command(
     denoise: bool = False,
     screen_size: tuple[int, int] | None = None,
     audio_offset_ms: int = 0,
+    marker_keyframes: bool = False,
 ) -> list:
     """
     Setzt das vollständige FFmpeg-Aufnahmekommando zusammen.
+
+    marker_keyframes: Sync-Marker aktiv (siehe syncfix.py) - in den ersten
+    MARKER_KEYFRAME_WINDOW_S Sekunden alle 0,5 s ein Schlüsselbild, damit
+    der Marker später ohne Neukodierung des Bildes knapp abgeschnitten
+    werden kann.
 
     audio_only=True überspringt die komplette Video-Eingabe (kein
     gdigrab/x11grab) - es wird ausschließlich die Audioquelle aufgezeichnet.
@@ -695,6 +705,10 @@ def build_record_command(
     # genau das vom Nutzer gemeldete Symptom "Aufnahme nur ein paar KB
     # groß". Ohne "-shortest" bleibt die Videospur in so einem Fall
     # vollständig erhalten, die Audiospur endet dann eben etwas früher.
+
+    if marker_keyframes and not audio_only:
+        cmd += ["-force_key_frames",
+                f"expr:lt(t,{MARKER_KEYFRAME_WINDOW_S})*gte(t,n_forced*0.5)"]
 
     cmd.append(output_path)
     return cmd

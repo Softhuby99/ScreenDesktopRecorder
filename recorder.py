@@ -294,6 +294,7 @@ class RecorderThread(threading.Thread):
                 audio_only=self.settings.get("audio_only", False),
                 gain=self.settings.get("gain", 1.0),
                 denoise=self.settings.get("denoise", False),
+                marker_keyframes=self.settings.get("marker_keyframes", False),
                 # Vom GUI-Thread VOR dem Threadstart ermittelt (siehe
                 # gui_main._start_recording) - build_video_input_args()
                 # darf get_screen_size() nicht selbst aufrufen, das würde

@@ -39,6 +39,7 @@ from calibration import (
     CALIB_FLASH_S, SOURCE_CALIBRATED, SOURCE_MANUAL, CalibrationThread,
     offset_note, remember_offset, stored_offset,
 )
+from syncfix import MarkerThread, SyncFixThread, describe_fix
 from benchmark import BenchmarkThread
 from config import (
     APP_NAME, APP_VERSION, AUDIO_OFFSET_MAX_MS, AUDIO_OFFSET_MIN_MS, AUDIO_OFFSET_STEPS,
@@ -117,8 +118,15 @@ class MainWindow(ctk.CTk):
         self._diagnosis_thread: DiagnosisThread | None = None
         # Ton-Kalibrierung (siehe calibration.py)
         self._calib_thread: CalibrationThread | None = None
-        self._calib_window = None
-        self._calib_flash_frame = None
+        self._flash_window = None
+        self._flash_frame = None
+        # Sync-Marker (siehe syncfix.py)
+        self._marker_thread: MarkerThread | None = None
+        self._syncfix_thread: SyncFixThread | None = None
+        self._marker_plan: dict | None = None
+        self._marker_end_s: float | None = None
+        self._marker_info: dict | None = None
+        self._marker_skip_reason: str | None = None
         self._timer_job = None
         self._region_job = None
         self._blink_state = True
@@ -151,6 +159,8 @@ class MainWindow(ctk.CTk):
         self._saved_settings: dict = load_settings()
         # Ton-Versatz je Mikrofon: {FFmpeg-ID: {ms, source, date}}
         self._audio_offsets: dict = dict(self._saved_settings.get("audio_offsets") or {})
+        self._sync_markers: dict = {k: bool(v) for k, v in
+                                    dict(self._saved_settings.get("sync_markers") or {}).items()}
         _legacy_dev = self._saved_settings.get("audio_device")
         try:
             _legacy_ms = int(self._saved_settings.get("audio_offset_ms", 0) or 0)
@@ -547,8 +557,24 @@ class MainWindow(ctk.CTk):
             text_color=COLOR_TEXT_MUTED, anchor="w",
         )
         self.offset_note_label.pack(side="left", padx=(10, 0))
+        self.sync_marker_var = ctk.BooleanVar(value=False)
+        self.sync_marker_chk = ctk.CTkCheckBox(
+            mic_card, text="Sync-Marker: Versatz in jeder Aufnahme messen und korrigieren",
+            variable=self.sync_marker_var, command=self._on_sync_marker_toggle,
+            font=("Segoe UI", 12), fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER,
+        )
+        self.sync_marker_chk.pack(fill="x", padx=14, pady=(8, 0), anchor="w")
+        ctk.CTkLabel(
+            mic_card,
+            text="Für Mikrofone, deren Verzögerung schwankt: Zu Beginn jeder Aufnahme "
+                 "blinkt ein Feld ca. 6 s lang mit Pieptönen (Lautsprecher an). Dieser "
+                 "Anfang wird danach weggeschnitten, der Ton exakt angepasst.",
+            font=("Segoe UI", 10), text_color=COLOR_TEXT_MUTED,
+            anchor="w", wraplength=410, justify="left",
+        ).pack(fill="x", padx=14)
         if not IS_WINDOWS:
             self.calib_btn.configure(state="disabled")
+            self.sync_marker_chk.configure(state="disabled")
             self.offset_note_label.configure(text="Kalibrierung nur unter Windows")
 
         self.denoise_var = ctk.BooleanVar(value=False)
@@ -732,6 +758,7 @@ class MainWindow(ctk.CTk):
             "denoise": bool(self.denoise_var.get()),
             "audio_offset_ms": self._audio_offset_ms(),
             "audio_offsets": self._audio_offsets,
+            "sync_markers": self._sync_markers,
         })
         if self._audio_devices_loaded:
             label = self.audio_var.get()
@@ -1029,6 +1056,7 @@ class MainWindow(ctk.CTk):
         self.audio_offset_var.set(ms)
         self._update_offset_label(ms)
         self._show_offset_note(ident)
+        self.sync_marker_var.set(bool(self._sync_markers.get(ident)) if ident else False)
 
     def _start_mic_meter(self, index: int | None):
         if self._mic_level_meter:
@@ -1378,86 +1406,71 @@ class MainWindow(ctk.CTk):
         self.start_btn.configure(state="normal")
 
     # ==================================================================
-    # TON KALIBRIEREN (siehe calibration.py / plan-kalibrierung.md)
+    # TON KALIBRIEREN + SYNC-MARKER (siehe calibration.py / syncfix.py)
     # ==================================================================
-    CALIB_WIN_W, CALIB_WIN_H = 360, 250       # Kalibrierfenster
-    CALIB_FLASH_W, CALIB_FLASH_H = 300, 180   # blitzender Bereich darin
+    FLASH_W, FLASH_H = 240, 140      # Blinkfeld (höchstens)
+    FLASH_INSET = 8                  # Rand, der bei der Auswertung nicht zählt
 
     def _calibrating(self) -> bool:
         t = self._calib_thread
         return t is not None and t.is_alive()
 
-    def _start_calibration(self):
-        if self._closing or self._calibrating() or self.recorder is not None:
-            return
-        if self.benchmark_thread is not None and self.benchmark_thread.is_alive():
-            return
-        label = self.audio_var.get()
-        ident = self._current_audio_ident()
-        if not ident:
-            messagebox.showinfo("Ton kalibrieren",
-                                "Bitte zuerst ein Mikrofon als Tonquelle wählen.")
-            return
-        if looks_like_system_audio(label):
-            messagebox.showinfo("Ton kalibrieren",
-                                "Die Kalibrierung ist für Mikrofone gedacht. Beim Systemton "
-                                "ist keine Korrektur nötig.")
-            return
-        if not messagebox.askokcancel(
-            "Ton kalibrieren",
-            f"Gemessen wird für:\n{label}\n\n"
-            "• Lautsprecher einschalten (kein geschlossener Kopfhörer)\n"
-            "• Lautstärke mittel\n"
-            "• etwa 20 Sekunden ruhig sein\n\n"
-            "Ein kleines Fenster blinkt dabei mehrmals, dazu ertönen Pieptöne.",
-        ):
-            return
-
-        self._pause_meters()
-        region = self._open_calibration_window()
-        for btn in (self.calib_btn, self.bench_btn, self.start_btn):
-            btn.configure(state="disabled")
-        self.offset_note_label.configure(text="Messung wird vorbereitet ...")
-        self._calib_ident = ident
-        self._calib_thread = CalibrationThread(
-            audio_device=ident, region=region, fps=self.fps_var.get(),
-            screen_size=self._current_screen_size(),
-            on_flash=lambda due: self._post_to_gui(self._calib_flash, due),
-            on_progress=lambda t: self._post_to_gui(self._calib_progress, t),
-            on_finish=lambda r: self._post_to_gui(self._calib_finish, r),
-            on_error=lambda m: self._post_to_gui(self._calib_error, m),
-        )
-        self._calib_thread.start()
-
-    def _open_calibration_window(self) -> tuple[int, int, int, int]:
+    def _capture_area(self, mode_region: bool, region) -> tuple[int, int, int, int]:
         """
-        Kleines schwarzes Fenster mittig auf dem Hauptbildschirm (dort
-        arbeitet ddagrab). Liefert den aufzunehmenden Bereich: nur das
-        blitzende Feld, mit etwas Rand, damit Kanten nicht mitzählen.
+        Aufgenommener Bereich in Bildschirmkoordinaten (x, y, w, h).
+        Sein Ursprung ist auch der Ursprung des Videobilds - daraus ergibt
+        sich der Ausschnitt (crop) des Blinkfelds in der Datei.
+        Vollbild: Hauptbildschirm (ddagrab nimmt output_idx=0 auf).
         """
+        if mode_region and region:
+            x, y, w, h = (int(v) for v in region)
+            return x, y, w - w % 2, h - h % 2
+        sw, sh = self._current_screen_size()
+        return 0, 0, sw, sh
+
+    def _plan_flash_field(self, area) -> dict | None:
+        """Blinkfeld mittig im Bereich; None, wenn der Bereich zu klein ist."""
+        ax, ay, aw, ah = area
+        fw, fh = min(self.FLASH_W, aw - 20), min(self.FLASH_H, ah - 50)
+        if fw < 80 or fh < 50:
+            return None
+        fx = ax + (aw - fw) // 2
+        fy = ay + max(0, (ah - fh) // 2 - 15)
+        i = self.FLASH_INSET
+        return {
+            "field": (fx, fy, fw, fh),
+            "crop": (fx - ax + i, fy - ay + i, fw - 2 * i, fh - 2 * i),
+        }
+
+    def _open_flash_window(self, plan: dict, caption: str):
+        """Kleines Fenster mit dem (zunächst schwarzen) Blinkfeld."""
         import tkinter as tk
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        x = max(0, (sw - self.CALIB_WIN_W) // 2)
-        y = max(0, (sh - self.CALIB_WIN_H) // 2)
+        self._close_flash_window()
+        fx, fy, fw, fh = plan["field"]
         win = tk.Toplevel(self)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg="#202020")
-        win.geometry(f"{self.CALIB_WIN_W}x{self.CALIB_WIN_H}+{x}+{y}")
-        fx = (self.CALIB_WIN_W - self.CALIB_FLASH_W) // 2
-        flash = tk.Frame(win, bg="black", width=self.CALIB_FLASH_W, height=self.CALIB_FLASH_H)
-        flash.place(x=fx, y=15)
-        tk.Label(win, text="Ton wird kalibriert – bitte nicht verdecken",
-                 bg="#202020", fg="#bbbbbb", font=("Segoe UI", 10)).place(
-                     x=0, y=15 + self.CALIB_FLASH_H + 12, width=self.CALIB_WIN_W)
+        win.geometry(f"{fw + 20}x{fh + 45}+{fx - 10}+{fy - 10}")
+        flash = tk.Frame(win, bg="black", width=fw, height=fh)
+        flash.place(x=10, y=10)
+        tk.Label(win, text=caption, bg="#202020", fg="#bbbbbb",
+                 font=("Segoe UI", 9)).place(x=0, y=fh + 18, width=fw + 20)
         win.update_idletasks()
-        self._calib_window, self._calib_flash_frame = win, flash
-        inset = 8
-        return (x + fx + inset, y + 15 + inset,
-                self.CALIB_FLASH_W - 2 * inset, self.CALIB_FLASH_H - 2 * inset)
+        self._flash_window, self._flash_frame = win, flash
 
-    def _calib_flash(self, due: float):
-        frame = self._calib_flash_frame
+    def _close_flash_window(self):
+        win = getattr(self, "_flash_window", None)
+        self._flash_window, self._flash_frame = None, None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _flash_at(self, due: float):
+        """Blinkfeld zum Zeitpunkt due (perf_counter) kurz weiß schalten."""
+        frame = getattr(self, "_flash_frame", None)
         if frame is None:
             return
         delay_ms = max(0, int(round((due - time.perf_counter()) * 1000)))
@@ -1478,16 +1491,74 @@ class MainWindow(ctk.CTk):
         self.after(delay_ms, on)
         self.after(delay_ms + int(CALIB_FLASH_S * 1000), off)
 
+    # ---- Kalibrierung -------------------------------------------------
+    def _start_calibration(self):
+        if self._closing or self._calibrating() or self.recorder is not None:
+            return
+        if self.benchmark_thread is not None and self.benchmark_thread.is_alive():
+            return
+        label = self.audio_var.get()
+        ident = self._current_audio_ident()
+        if not ident:
+            messagebox.showinfo("Ton kalibrieren",
+                                "Bitte zuerst ein Mikrofon als Tonquelle wählen.")
+            return
+        if looks_like_system_audio(label):
+            messagebox.showinfo("Ton kalibrieren",
+                                "Die Kalibrierung ist für Mikrofone gedacht. Beim Systemton "
+                                "ist keine Korrektur nötig.")
+            return
+        mode_region = self.mode_var.get() == MODE_REGION
+        if mode_region and not self.region:
+            messagebox.showwarning("Kein Bereich", "Bitte zuerst einen Bereich wählen.")
+            return
+        plan = self._plan_flash_field(self._capture_area(mode_region, self.region))
+        if plan is None:
+            messagebox.showwarning("Bereich zu klein",
+                                   "Der gewählte Bereich ist für das Blinkfeld zu klein. "
+                                   "Bitte einen größeren Bereich oder Vollbild wählen.")
+            return
+        if not messagebox.askokcancel(
+            "Ton kalibrieren",
+            f"Gemessen wird für:\n{label}\n\n"
+            "• Lautsprecher einschalten (kein geschlossener Kopfhörer)\n"
+            "• Lautstärke mittel\n"
+            "• etwa eine Minute ruhig sein\n\n"
+            "Ein Feld blinkt in drei Durchläufen je 5-mal, dazu ertönen Pieptöne. "
+            "Aufgenommen wird mit denselben Einstellungen wie bei einer echten "
+            "Aufnahme (Bereich, Bildrate, Preset).",
+        ):
+            return
+
+        self._pause_meters()
+        self._open_flash_window(plan, "Ton wird kalibriert – bitte nicht verdecken")
+        for btn in (self.calib_btn, self.bench_btn, self.start_btn):
+            btn.configure(state="disabled")
+        self.offset_note_label.configure(text="Messung wird vorbereitet ...")
+        self._calib_ident = ident
+        folder = self.path_var.get().strip()
+        self._calib_thread = CalibrationThread(
+            record_settings={
+                "fps": self.fps_var.get(), "encoder": self.encoder_var.get(),
+                "preset": self.preset_var.get(), "mode_region": mode_region,
+                "region": self.region if mode_region else None, "audio_device": ident,
+                "gain": self.mic_gain_var.get(), "denoise": self.denoise_var.get(),
+                "screen_size": self._current_screen_size(),
+            },
+            crop=plan["crop"],
+            log_dir=folder if os.path.isdir(folder) else None,
+            on_flash=lambda due: self._post_to_gui(self._flash_at, due),
+            on_progress=lambda t: self._post_to_gui(self._calib_progress, t),
+            on_finish=lambda r: self._post_to_gui(self._calib_finish, r),
+            on_error=lambda m: self._post_to_gui(self._calib_error, m),
+        )
+        self._calib_thread.start()
+
     def _calib_progress(self, text: str):
         self.offset_note_label.configure(text=text)
 
     def _close_calibration(self):
-        win, self._calib_window, self._calib_flash_frame = self._calib_window, None, None
-        if win is not None:
-            try:
-                win.destroy()
-            except Exception:
-                pass
+        self._close_flash_window()
         for btn in (self.bench_btn, self.start_btn):
             btn.configure(state="normal")
         if IS_WINDOWS:
@@ -1500,33 +1571,108 @@ class MainWindow(ctk.CTk):
     def _calib_finish(self, result: dict):
         self._close_calibration()
         ident = getattr(self, "_calib_ident", None)
+        log_hint = (f"\n\nProtokoll: {os.path.basename(result['log_path'])}"
+                    if result.get("log_path") else "")
         if not result.get("ok"):
             self._show_offset_note(self._current_audio_ident())
             messagebox.showwarning("Kalibrierung nicht möglich",
-                                   result.get("reason") or "Unbekannter Fehler.")
+                                   (result.get("reason") or "Unbekannter Fehler.") + log_hint)
             return
         ms = int(result["correction_ms"])
-        late = int(result["lateness_ms"])
+        late = -ms
         self._audio_offsets = remember_offset(self._audio_offsets, ident, ms, SOURCE_CALIBRATED)
         if ident == self._current_audio_ident():
             self._apply_stored_offset(ident)
         self._save_settings()
-        if late > 0:
-            what = f"Der Ton kam {late} ms zu spät."
-        elif late < 0:
-            what = f"Der Ton kam {-late} ms zu früh."
-        else:
-            what = "Ton und Bild waren bereits synchron."
-        messagebox.showinfo(
-            "Kalibrierung abgeschlossen",
-            f"{what}\nTon-Versatz auf {ms:+d} ms gesetzt und für dieses Mikrofon "
-            f"gespeichert.\n\n({result['pairs']} Messpunkte, Streuung {result['spread_ms']} ms)",
+        what = (f"Der Ton kommt {late} ms zu spät." if late > 0 else
+                f"Der Ton kommt {-late} ms zu früh." if late < 0 else
+                "Ton und Bild sind bereits synchron.")
+        rest = ", ".join(f"{r:+d}" for r in result.get("rest_ms", []))
+        if result.get("stable"):
+            messagebox.showinfo(
+                "Kalibrierung abgeschlossen",
+                f"{what}\nTon-Versatz auf {ms:+d} ms gesetzt und für dieses Mikrofon "
+                f"gespeichert.\n\nGegenprobe über {result['good_runs']} Durchläufe: "
+                f"Rest {rest} ms (Schwankung {result['run_spread_ms']} ms).{log_hint}",
+            )
+            return
+        enable = messagebox.askyesno(
+            "Mikrofon schwankt",
+            f"{what.replace('kommt', 'kam im Mittel')}\nDie Verzögerung schwankt aber von "
+            f"Aufnahme zu Aufnahme um {result['run_spread_ms']} ms (Rest {rest} ms). "
+            f"Ein fester Wert ist hier nicht zuverlässig.\n\n"
+            f"Der Ton-Versatz ist als Startwert auf {ms:+d} ms gesetzt.\n\n"
+            "Sync-Marker für dieses Mikrofon einschalten? Dann wird der Versatz in "
+            "jeder Aufnahme gemessen und korrigiert (kurzes Blinken und Piepen am "
+            f"Anfang, das danach weggeschnitten wird).{log_hint}",
         )
+        if enable and ident:
+            self._sync_markers[ident] = True
+            if ident == self._current_audio_ident():
+                self.sync_marker_var.set(True)
+            self._save_settings()
 
     def _calib_error(self, message: str):
         self._close_calibration()
         self._show_offset_note(self._current_audio_ident())
         messagebox.showerror("Kalibrierung fehlgeschlagen", message)
+
+    # ---- Sync-Marker (während der Aufnahme) -----------------------------
+    def _on_sync_marker_toggle(self):
+        ident = self._current_audio_ident()
+        if ident:
+            self._sync_markers[ident] = bool(self.sync_marker_var.get())
+            self._save_settings()
+
+    def _plan_marker(self, audio_device, audio_label: str, audio_only: bool,
+                     mode_region: bool, region) -> dict | None:
+        """Marker für diese Aufnahme planen - None, wenn er nicht dran ist."""
+        if not IS_WINDOWS or audio_only or not audio_device:
+            return None
+        if not self._sync_markers.get(audio_device) or looks_like_system_audio(audio_label):
+            return None
+        plan = self._plan_flash_field(self._capture_area(mode_region, region))
+        if plan is None:
+            self._marker_skip_reason = "Bereich für das Blinkfeld zu klein"
+        return plan
+
+    def _marker_active(self) -> bool:
+        t = getattr(self, "_marker_thread", None)
+        return t is not None and t.is_alive()
+
+    def _start_marker(self):
+        plan = self._marker_plan
+        if not plan or self._closing:
+            return
+        self._open_flash_window(plan, "Sync-Marker – bitte kurz warten")
+        self._marker_thread = MarkerThread(
+            on_flash=lambda due: self._post_to_gui(self._flash_at, due),
+            on_done=lambda info: self._post_to_gui(self._marker_done, info),
+        )
+        self._marker_thread.start()
+
+    def _marker_done(self, info: dict):
+        self._close_flash_window()
+        self._marker_info = info
+        rec = self.recorder
+        if info.get("ok") and rec is not None:
+            try:
+                self._marker_end_s = float(rec.get_elapsed())
+            except Exception:
+                self._marker_end_s = None
+
+    def _run_syncfix(self, path: str, after):
+        """Korrektur im Hintergrund; danach after(cut_s) im GUI-Thread."""
+        self._set_status("Ton wird mit dem Bild synchronisiert ...", COLOR_TEXT_MUTED)
+        self._syncfix_thread = SyncFixThread(
+            path, self._marker_plan["crop"], self._marker_end_s,
+            on_finish=lambda res: self._post_to_gui(self._syncfix_done, res, after),
+        )
+        self._syncfix_thread.start()
+
+    def _syncfix_done(self, result: dict, after):
+        cut = float(result.get("cut_s") or 0.0) if result.get("fixed") else 0.0
+        after(result, cut)
 
     # ==================================================================
     # AUFNAHME
@@ -1569,6 +1715,13 @@ class MainWindow(ctk.CTk):
                 messagebox.showwarning("Kein Bereich", "Bitte zuerst einen Bereich wählen.")
                 return
 
+        # Sync-Marker fuer diese Aufnahme planen (siehe syncfix.py)
+        self._marker_skip_reason = None
+        self._marker_end_s = None
+        self._marker_info = None
+        self._marker_plan = self._plan_marker(audio_device, audio_label, audio_only,
+                                              mode_region, region)
+
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         extension = AUDIO_ONLY_EXTENSION if audio_only else "mp4"
         output_path = os.path.join(folder, f"Aufnahme_{timestamp}.{extension}")
@@ -1587,6 +1740,7 @@ class MainWindow(ctk.CTk):
             "audio_offset_ms": self._audio_offset_ms(),
             # Auf dem GUI-Thread ermittelt - siehe _current_screen_size().
             "screen_size": self._current_screen_size(),
+            "marker_keyframes": self._marker_plan is not None,
         }
 
         # Für _on_recording_started() (siehe dort): merken, WELCHER Modus
@@ -1648,6 +1802,8 @@ class MainWindow(ctk.CTk):
         )
         self.mini_panel.set_fps_text("Audio" if audio_only else f"{self.fps_var.get()} FPS")
         self._tick_timer()
+        if self._marker_plan:
+            self._start_marker()
 
     def _tick_timer(self):
         """Aktualisiert Timer + Blinkpunkt im Sekundentakt."""
@@ -1666,8 +1822,9 @@ class MainWindow(ctk.CTk):
 
     def _toggle_pause(self) -> bool:
         rec = self.recorder
-        if self._closing:
-            # Zustand bleibt unverändert - nur den aktuellen melden.
+        if self._closing or self._marker_active():
+            # Zustand bleibt unverändert - nur den aktuellen melden
+            # (während des Sync-Markers darf nicht pausiert werden).
             return bool(rec.is_paused) if rec else False
         return rec.toggle_pause() if rec else False
 
@@ -1680,6 +1837,8 @@ class MainWindow(ctk.CTk):
             except Exception:
                 pass
             self._timer_job = None
+        if self._marker_active():
+            self._marker_thread.cancel()
         rec = self.recorder
         if rec:
             rec.stop()
@@ -1687,6 +1846,10 @@ class MainWindow(ctk.CTk):
     def _on_recording_stopped(self, path: str, success: bool):
         if self._closing:
             return  # kein Dialog, kein deiconify im Zustand "schließt"
+        # Sync-Marker ggf. noch aktiv (Stopp/Fehler waehrend des Markers)
+        if self._marker_active():
+            self._marker_thread.cancel()
+        self._close_flash_window()
         rec = self.recorder
         # Vor dem Zuruecksetzen sichern - wird gebraucht, um eine evtl.
         # vorzeitig abgeschnittene Aufnahme zu erkennen (siehe
@@ -1732,31 +1895,73 @@ class MainWindow(ctk.CTk):
         log_path = self._write_recording_log(path, stderr_lines, command, elapsed, success)
 
         if success:
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            self._set_status(
-                f"✓ Gespeichert: {os.path.basename(path)}  ({size_mb:.1f} MB)",
-                COLOR_SUCCESS,
-            )
-            # Nur bei echten VIDEO-Aufnahmen als Vorauswahl für "Video
-            # verkleinern" übernehmen - eine reine .m4a-Tonaufnahme hat
-            # keinen Videostream, den die Optimierungsprofile (allesamt
-            # Video-Encoder) verarbeiten könnten.
-            if not self._active_audio_only:
-                self._set_optimize_file(path)
-            self._start_diagnosis(path, elapsed, log_path, requested_fps,
-                                  self._recording_had_audio, audio_offset_ms)
-            if messagebox.askyesno(
-                "Aufnahme fertig",
-                f"Datei gespeichert:\n{os.path.basename(path)}  ({size_mb:.1f} MB)\n\n"
-                "Ordner jetzt öffnen?",
-            ):
-                open_file_manager(path)
+            marker_note = self._marker_log_note()
+            if marker_note:
+                self._append_recording_log(log_path, marker_note)
+            if (self._marker_plan and self._marker_end_s and not self._active_audio_only):
+                def after(result, cut_s):
+                    self._append_recording_log(log_path, describe_fix(result))
+                    self._finish_saved(path, max(0.0, elapsed - cut_s), log_path,
+                                       requested_fps, audio_offset_ms, result)
+                self._run_syncfix(path, after)
+                return
+            self._finish_saved(path, elapsed, log_path, requested_fps, audio_offset_ms)
         else:
             hint = f"  (Details: {os.path.basename(log_path)})" if log_path else ""
             self._set_status(
                 f"Aufnahme fehlgeschlagen – keine verwertbare Datei.{hint}",
                 COLOR_DANGER,
             )
+
+    def _marker_log_note(self) -> str | None:
+        """Zeile zum Sync-Marker fuer das Log, falls er geplant war oder entfiel."""
+        if self._marker_skip_reason:
+            return f"Sync-Marker:    übersprungen – {self._marker_skip_reason}"
+        if not self._marker_plan:
+            return None
+        info = self._marker_info or {}
+        if not self._marker_end_s:
+            why = info.get("error") or "Aufnahme vor Ende des Markers gestoppt"
+            return f"Sync-Marker:    nicht vollständig abgespielt ({why}) – keine Korrektur"
+        return (f"Sync-Marker:    abgespielt über {info.get('device') or '?'} "
+                f"(gemeldete Latenz {info.get('latency_ms')} ms), Ende bei "
+                f"{self._marker_end_s:.2f} s")
+
+    def _finish_saved(self, path: str, elapsed: float, log_path, requested_fps: float,
+                      audio_offset_ms: int, fix_result: dict | None = None):
+        """Gespeicherte Aufnahme: Status, Diagnose, Rückfrage 'Ordner öffnen'."""
+        if self._closing:
+            return
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+        self._set_status(
+            f"✓ Gespeichert: {os.path.basename(path)}  ({size_mb:.1f} MB)",
+            COLOR_SUCCESS,
+        )
+        # Nur bei echten VIDEO-Aufnahmen als Vorauswahl für "Video
+        # verkleinern" übernehmen - eine reine .m4a-Tonaufnahme hat
+        # keinen Videostream, den die Optimierungsprofile (allesamt
+        # Video-Encoder) verarbeiten könnten.
+        if not self._active_audio_only:
+            self._set_optimize_file(path)
+        self._start_diagnosis(path, elapsed, log_path, requested_fps,
+                              self._recording_had_audio, audio_offset_ms)
+        sync_line = ""
+        if fix_result is not None:
+            if fix_result.get("fixed"):
+                sync_line = (f"\nTon synchronisiert ({fix_result['lateness_ms']:+d} ms "
+                             "korrigiert, Marker entfernt).")
+            else:
+                sync_line = (f"\nSync-Marker nicht ausgewertet: "
+                             f"{fix_result.get('reason') or '?'} – Datei unverändert.")
+        if messagebox.askyesno(
+            "Aufnahme fertig",
+            f"Datei gespeichert:\n{os.path.basename(path)}  ({size_mb:.1f} MB){sync_line}\n\n"
+            "Ordner jetzt öffnen?",
+        ):
+            open_file_manager(path)
 
     def _start_diagnosis(self, path: str, capture_seconds: float, log_path: str | None,
                          requested_fps: float = 0.0, had_audio: bool = False,
@@ -2254,7 +2459,9 @@ class MainWindow(ctk.CTk):
             # selbst auf.
             wait_for_workers(
                 [self.benchmark_thread, self._optimize_thread, self._diagnosis_thread,
-                 getattr(self, "_calib_thread", None)],
+                 getattr(self, "_calib_thread", None),
+                 getattr(self, "_marker_thread", None),
+                 getattr(self, "_syncfix_thread", None)],
                 pump=self._pump_events,
             )
         finally:

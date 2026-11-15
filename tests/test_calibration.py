@@ -25,7 +25,7 @@ class SignalTest(unittest.TestCase):
 
 
 class EvaluateTest(unittest.TestCase):
-    video = [3.0, 5.0, 7.0, 9.0, 11.0, 13.0]
+    video = [3.0, 5.4, 7.8, 10.2, 12.6]
 
     def test_late_audio_gives_negative_correction(self):
         audio = [t + 0.2 for t in self.video]
@@ -33,7 +33,7 @@ class EvaluateTest(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["lateness_ms"], 200)
         self.assertEqual(r["correction_ms"], -200)
-        self.assertEqual(r["pairs"], 6)
+        self.assertEqual(r["pairs"], 5)
 
     def test_rounding_to_10ms(self):
         r = c.evaluate(self.video, [t + 0.153 for t in self.video])
@@ -59,13 +59,13 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(r["pairs"], 3)
 
     def test_spread_too_large(self):
-        audio = [t + d for t, d in zip(self.video, [0.1, 0.2, 0.1, 0.2, 0.1, 0.2])]
+        audio = [t + d for t, d in zip(self.video, [0.1, 0.2, 0.1, 0.2, 0.1])]
         r = c.evaluate(self.video, audio)
         self.assertFalse(r["ok"])
         self.assertIn("unruhig", r["reason"])
 
     def test_far_away_beeps_are_not_paired(self):
-        self.assertEqual(c.pair_offsets([3.0], [4.5]), [])
+        self.assertEqual(c.pair_offsets([3.0], [4.3]), [])
 
 
 class OnsetTest(unittest.TestCase):
@@ -147,7 +147,6 @@ class FakeProcess:
         self.stderr = mock.MagicMock()
         self.stderr.readline.return_value = b""
         self.returncode = None
-        self.killed = False
 
     def poll(self):
         return self.returncode
@@ -157,74 +156,129 @@ class FakeProcess:
         return 0
 
     def kill(self):
-        self.killed = True
         self.returncode = -9
 
 
 class FakePlayer:
-    def __init__(self, on_beep):
-        self.on_beep = on_beep
+    def __init__(self, on_beep, beeps=c.CALIB_BEEPS, interval=c.CALIB_INTERVAL_S):
+        self.on_beep, self.beeps = on_beep, beeps
         self.done = threading.Event()
-        self.stopped = False
+        self.device_info, self.latency_s, self.dac_beeps = "Fake [WASAPI]", 0.01, beeps
 
     def start(self):
-        for i in range(c.CALIB_BEEPS):
+        for i in range(self.beeps):
             self.on_beep(100.0 + i)
         self.done.set()
 
     def stop(self):
-        self.stopped = True
+        self.done.set()
+
+
+def run_result(lateness, applied=0, ok=True):
+    r = {"ok": ok, "lateness_ms": lateness, "spread_ms": 10, "pairs": 5,
+         "flash_times": [], "beep_times": [], "reason": "" if ok else "kaputt"}
+    r["applied_ms"] = applied
+    return r
+
+
+class CombineRunsTest(unittest.TestCase):
+    def test_stable_device(self):
+        runs = [run_result(510), run_result(5, -510), run_result(-12, -510)]
+        r = c.combine_runs(runs)
+        self.assertTrue(r["ok"] and r["stable"])
+        self.assertEqual(r["true_ms"], [510, 515, 498])
+        self.assertEqual(r["correction_ms"], -510)
+        self.assertEqual(r["rest_ms"], [0, 5, -12])
+
+    def test_unstable_device(self):
+        # wie das zweite Notebook: einmal 510, einmal 810 ms
+        runs = [run_result(510), run_result(300, -510), run_result(0, -510)]
+        r = c.combine_runs(runs)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["stable"])
+        self.assertEqual(r["run_spread_ms"], 300)
+
+    def test_too_few_good_runs(self):
+        r = c.combine_runs([run_result(0, ok=False), run_result(100)])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "kaputt")
 
 
 class WorkerTest(unittest.TestCase):
     def setUp(self):
-        patches = [
-            mock.patch.object(c, "CALIB_LEAD_S", 0.01),
-            mock.patch.object(c, "CALIB_TAIL_S", 0.01),
-            mock.patch.object(c, "build_record_command", return_value=["ffmpeg", "x"]),
-        ]
-        for p in patches:
+        for p in (mock.patch.object(c, "CALIB_LEAD_S", 0.01),
+                  mock.patch.object(c, "CALIB_TAIL_S", 0.01),
+                  mock.patch.object(c, "build_record_command",
+                                    side_effect=lambda *a, **k: ["ffmpeg", str(k.get("audio_offset_ms"))])):
             p.start()
             self.addCleanup(p.stop)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def _run(self, analyze, **kw):
-        events = {"flash": [], "finish": [], "error": []}
+    def _run(self, analyze):
+        ev = {"flash": [], "finish": [], "error": []}
         t = c.CalibrationThread(
-            "Mic", (0, 0, 100, 100), "30", (1920, 1080),
-            on_flash=events["flash"].append, on_finish=events["finish"].append,
-            on_error=events["error"].append,
-            player_factory=FakePlayer, popen=FakeProcess, analyze=analyze, **kw,
+            {"fps": "30", "audio_device": "Mic"}, (0, 0, 100, 100), log_dir=self.tmp,
+            on_flash=ev["flash"].append, on_finish=ev["finish"].append,
+            on_error=ev["error"].append, player_factory=FakePlayer,
+            popen=FakeProcess, analyze=analyze,
         )
         t.start()
         t.join(5)
         self.assertFalse(t.is_alive())
-        return events
+        return ev
 
-    def test_success_path(self):
-        result = {"ok": True, "correction_ms": -200}
-        ev = self._run(lambda path: result)
-        self.assertEqual(ev["finish"], [result])
-        self.assertEqual(len(ev["flash"]), c.CALIB_BEEPS)
-        self.assertEqual(ev["error"], [])
+    def test_three_runs_with_counter_check(self):
+        applied = []
+        lat = iter([200, 3, -4])
 
-    def test_temp_file_removed(self):
-        seen = []
-        self._run(lambda path: seen.append(path) or {"ok": False})
-        self.assertFalse(os.path.exists(seen[0]))
+        def analyze(path, crop):
+            return run_result(next(lat))
+        with mock.patch.object(c, "build_record_command",
+                               side_effect=lambda *a, **k: applied.append(k["audio_offset_ms"]) or ["x"]):
+            ev = self._run(analyze)
+        self.assertEqual(applied, [0, -200, -200])
+        r = ev["finish"][0]
+        self.assertTrue(r["ok"] and r["stable"])
+        self.assertEqual(r["correction_ms"], -200)
+        self.assertEqual(len(ev["flash"]), 3 * c.CALIB_BEEPS)
+        log = open(r["log_path"], encoding="utf-8").read()
+        self.assertIn("Durchlauf 3", log)
+        self.assertIn("stabil", log)
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith(".mp4")], [])
+
+    def test_unstable_keeps_recordings(self):
+        lat = iter([510, 300, 0])
+
+        def analyze(path, crop):
+            with open(path, "wb") as f:      # FFmpeg-Ersatz: Datei hat Inhalt
+                f.write(b"x")
+            return run_result(next(lat))
+        ev = self._run(analyze)
+        r = ev["finish"][0]
+        self.assertFalse(r["stable"])
+        self.assertIn("SCHWANKEND", open(r["log_path"], encoding="utf-8").read())
+        self.assertEqual(len([f for f in os.listdir(self.tmp) if f.endswith(".mp4")]), 3)
+
+    def test_two_failures_stop_early(self):
+        calls = []
+        ev = self._run(lambda p, crop: calls.append(1) or run_result(0, ok=False))
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(ev["finish"][0]["ok"])
 
     def test_error_reported(self):
-        def boom(path):
+        def boom(path, crop):
             raise RuntimeError("kaputt")
         ev = self._run(boom)
         self.assertEqual(ev["finish"], [])
         self.assertIn("kaputt", ev["error"][0])
 
     def test_cancel_before_start_is_silent(self):
-        t = c.CalibrationThread("Mic", (0, 0, 10, 10), "30", None,
+        t = c.CalibrationThread({"fps": "30"}, None,
                                 on_finish=lambda r: self.fail("finish"),
                                 on_error=lambda m: self.fail("error"),
                                 player_factory=FakePlayer, popen=FakeProcess,
-                                analyze=lambda p: {"ok": True})
+                                analyze=lambda p, crop: run_result(0))
         t.cancel()
         t.start()
         t.join(5)
